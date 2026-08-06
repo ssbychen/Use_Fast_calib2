@@ -1,67 +1,53 @@
-cmake_minimum_required(VERSION 3.0.2)
-project(fast_calib)
+cmake_minimum_required(VERSION 3.14)
+project(fast_calib2 LANGUAGES C CXX)
 
-find_package(catkin REQUIRED COMPONENTS
-  roscpp
-  sensor_msgs
-  pcl_ros
-  pcl_conversions
-  geometry_msgs
-)
-
-find_package(PCL 1.10 REQUIRED)
-find_package(OpenCV REQUIRED)
-
-catkin_package(
-  CATKIN_DEPENDS roscpp sensor_msgs pcl_conversions pcl_ros
-)
-
-include_directories(
-  include
-  ${catkin_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
-  ${OpenCV_INCLUDE_DIRS}
-)
-
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_BUILD_TYPE Release)
 
-if (CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
-endif()
+find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io filters segmentation features registration)
+find_package(yaml-cpp REQUIRED)
+find_package(GTest REQUIRED)
 
-add_executable(fast_calib src/main.cpp)
+add_definitions(${PCL_DEFINITIONS})
 
-target_link_libraries(fast_calib
-  ${catkin_LIBRARIES}
-  ${PCL_LIBRARIES}
-  ${OpenCV_LIBRARIES}
-)
-
-add_executable(lidar_center_test test/lidar_center_test.cpp)
-target_include_directories(lidar_center_test PRIVATE
+set(PROJECT_INCLUDE_DIRS
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${EIGEN3_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS}
 )
 
-target_link_libraries(lidar_center_test
-  ${catkin_LIBRARIES}
-  ${PCL_LIBRARIES}
-  ${OpenCV_LIBRARIES}
-)
+function(configure_fast_calib_target target)
+  target_include_directories(${target} PRIVATE ${PROJECT_INCLUDE_DIRS})
+  target_link_libraries(${target} PRIVATE
+    Eigen3::Eigen
+    ${OpenCV_LIBRARIES}
+    ${PCL_LIBRARIES}
+    yaml-cpp
+  )
+endfunction()
+
+add_executable(fast_calib2 src/main.cpp)
+configure_fast_calib_target(fast_calib2)
 
 add_executable(multi_fast_calib src/multi_scene.cpp)
-target_link_libraries(multi_fast_calib
-  ${catkin_LIBRARIES}
-  ${PCL_LIBRARIES}
-  ${OpenCV_LIBRARIES}
-)
+configure_fast_calib_target(multi_fast_calib)
 
-if(CATKIN_ENABLE_TESTING)
-  catkin_add_gtest(common_lib_test test/common_lib_test.cpp)
-  if(TARGET common_lib_test)
-    target_link_libraries(common_lib_test
-      ${catkin_LIBRARIES}
-      ${PCL_LIBRARIES}
-      ${OpenCV_LIBRARIES}
-    )
-  endif()
-endif()
+add_executable(lidar_center_test test/lidar_center_test.cpp)
+configure_fast_calib_target(lidar_center_test)
+
+add_executable(common_lib_test test/common_lib_test.cpp)
+target_include_directories(common_lib_test PRIVATE ${PROJECT_INCLUDE_DIRS})
+target_link_libraries(common_lib_test PRIVATE
+  Eigen3::Eigen
+  ${OpenCV_LIBRARIES}
+  ${PCL_LIBRARIES}
+  yaml-cpp
+  GTest::gtest
+  GTest::gtest_main
+)

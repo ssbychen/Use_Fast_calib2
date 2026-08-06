@@ -1,16 +1,11 @@
-
-#include <ros/ros.h>
 #include <Eigen/Dense>
 #include <fstream>
-#include <sstream>
-#include <regex>
-#include <vector>
-#include <string>
 #include <iomanip>
-#include <sys/stat.h>
-#include <cmath>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
 #include "common_lib.h"
-#include "data_preprocess.hpp"
 
 struct RigidResult 
 {
@@ -21,8 +16,8 @@ struct RigidResult
 };
 struct Block {
   std::string time_line;
-  std::vector<Eigen::Vector3d> lidar_pts; // 4
-  std::vector<Eigen::Vector3d> qr_pts;    // 4
+  std::vector<Eigen::Vector3d> lidar_pts;
+  std::vector<Eigen::Vector3d> qr_pts;
 };
 
 RigidResult SolveRigidTransformWeighted(
@@ -81,18 +76,14 @@ RigidResult SolveRigidTransformWeighted(
 
 static bool parseCentersLine(const std::string& line, std::vector<Eigen::Vector3d>& out_pts)
 {
-    // 支持形如：lidar_centers: {x,y,z} {x,y,z} {x,y,z} {x,y,z}
-    // 或 qr_centers: {x,y,z} {x,y,z} ...
     std::regex brace_re("\\{([^\\}]*)\\}");
     auto begin = std::sregex_iterator(line.begin(), line.end(), brace_re);
     auto end   = std::sregex_iterator();
 
     out_pts.clear();
     for (auto it = begin; it != end; ++it) {
-        std::string xyz = (*it)[1]; // "x,y,z"
-        // 去空格
+        std::string xyz = (*it)[1];
         xyz.erase(remove_if(xyz.begin(), xyz.end(), ::isspace), xyz.end());
-        // 用逗号分割
         std::vector<double> vals;
         std::stringstream ss(xyz);
         std::string tok;
@@ -107,11 +98,41 @@ static bool parseCentersLine(const std::string& line, std::vector<Eigen::Vector3
     return !out_pts.empty();
 }
 
+namespace
+{
+std::string parseConfigPath(int argc, char** argv)
+{
+    std::string config_path;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg = argv[i];
+        if (arg == "--config")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --config" << std::endl;
+                return std::string();
+            }
+            config_path = argv[++i];
+        }
+        else if (config_path.empty())
+        {
+            config_path = arg;
+        }
+        else
+        {
+            std::cerr << "Unknown argument: " << arg << std::endl;
+            return std::string();
+        }
+    }
+    return config_path;
+}
+}
+
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "multi_fast_calib");
-    ros::NodeHandle nh;
-    Params params = loadParameters(nh);
+    const std::string config_path = parseConfigPath(argc, argv);
+    Params params = loadParameters(config_path);
 
     std::string output_error;
     if (!ensureDirectoryTree(params.output_path, output_error))
@@ -125,7 +146,6 @@ int main(int argc, char** argv)
 
     std::string multi_output_path = params.output_path + "multi_calib_result.txt";
 
-    // 读取全部行
     std::ifstream fin(midtxt_path);
     if (!fin.is_open())
     {
@@ -143,7 +163,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 解析所有 block（按三行一组：time + lidar_centers + qr_centers）
     std::vector<Block> blocks;
     for (size_t i = 0; i + 2 < lines.size(); ++i) 
     {
@@ -156,11 +175,10 @@ int main(int argc, char** argv)
 
             if (!parseCentersLine(lines[i+1], b.lidar_pts)) continue;
             if (!parseCentersLine(lines[i+2], b.qr_pts))    continue;
-            // 要求每组正好4个
             if (b.lidar_pts.size() == 4 && b.qr_pts.size() == 4) 
             {
                 blocks.push_back(std::move(b));
-                i += 2; // 跳过这个block
+                i += 2;
             }
         }
     }
@@ -170,12 +188,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 取最后3个 block
     std::vector<Eigen::Vector3d> L, C;
     for (size_t k = blocks.size() - 3; k < blocks.size(); ++k) 
     {
         const auto& b = blocks[k];
-        // 依次拼入，保持顺序一致
         for (int i = 0; i < 4; ++i) 
         {
             L.push_back(b.lidar_pts[i]);
@@ -196,14 +212,12 @@ int main(int argc, char** argv)
         std::cout << "C[" << i << "]: (" << C[i](0) << ", " << C[i](1) << ", " << C[i](2) << ")" << std::endl;
     }
 
-    // 一次性求解
     auto res = SolveRigidTransformWeighted(L, C, nullptr);
     if (!res.ok) {
         ROS_ERROR("SolveRigidTransformWeighted failed.");
         return 1;
     }
 
-    // 打印 / 保存
     Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
     T.block<3,3>(0,0) = res.R;
     T.block<3,1>(0,3) = res.t;

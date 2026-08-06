@@ -9,32 +9,42 @@ which is included as part of this source code package.
 #define COMMON_LIB_H
 #define PCL_NO_PRECOMPILE
 
-#include <pcl/io/pcd_io.h>
-#include <pcl/point_types.h>
-#include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/filters/extract_indices.h>
+#include <Eigen/Dense>
+#include <yaml-cpp/yaml.h>
 #include <pcl/common/transforms.h>
-#include <pcl_ros/point_cloud.h>
-#include <pcl_ros/filters/passthrough.h>
-#include <pcl_conversions/pcl_conversions.h>
-#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/features/boundary.h>
 #include <pcl/features/normal_3d.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/registration/transformation_estimation_svd.h>
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/extract_clusters.h>
-#include <pcl/registration/transformation_estimation_svd.h>
+#include <pcl/segmentation/sac_segmentation.h>
 #include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <cctype>
-#include <cstdint>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <opencv2/opencv.hpp>
+#include <memory>
 #include <sstream>
+#include <string>
+#include <type_traits>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <tf/tf.h>
+#include <vector>
 #include "color.h"
 
 using namespace std;
@@ -45,15 +55,22 @@ using namespace pcl;
 #define DEBUG 1
 #define GEOMETRY_TOLERANCE 0.08
 
+#define ROS_INFO(fmt, ...)  do { std::printf("[INFO] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define ROS_WARN(fmt, ...)  do { std::fprintf(stderr, "[WARN] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define ROS_ERROR(fmt, ...) do { std::fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define ROS_INFO_STREAM(x)  do { std::cout << "[INFO] " << x << std::endl; } while (0)
+#define ROS_WARN_STREAM(x)  do { std::cerr << "[WARN] " << x << std::endl; } while (0)
+#define ROS_ERROR_STREAM(x) do { std::cerr << "[ERROR] " << x << std::endl; } while (0)
+
 // ===== 自定义点类型：XYZ + intensity + ring + scan id =====
-namespace Common 
+namespace Common
 {
   struct Point
   {
     PCL_ADD_POINT4D;
     float intensity = 0.0f;      // LiDAR intensity / reflectivity
     std::uint16_t ring = 0;      // 线号（机械雷达/多线雷达）
-    std::uint32_t scan_id = 0;   // 原始 ROS 消息编号，防止不同扫描帧的 ring 点混排
+    std::uint32_t scan_id = 0;   // 原始点云帧编号
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   } EIGEN_ALIGN16;
 }
@@ -78,91 +95,133 @@ struct Params {
   double auto_roi_voxel_leaf, annulus_voxel_leaf, auto_roi_geometry_max_error;
   int min_detected_markers;
   string image_path;
-  string bag_path;
-  string lidar_topic;
+  string pcd_path;
   string lidar_forward_axis;
   string lidar_up_axis;
   string output_path;
 };
 
 // 读取参数
-Params loadParameters(ros::NodeHandle &nh) {
-  Params params;
-  nh.param("camera_width", params.camera_width, 0);
-  nh.param("camera_height", params.camera_height, 0);
-  nh.param("fx", params.fx, 1215.31801774424);
-  nh.param("fy", params.fy, 1214.72961288138);
-  nh.param("cx", params.cx, 1047.86571859677);
-  nh.param("cy", params.cy, 745.068353101898);
-  nh.param("k1", params.k1, -0.33574781188503);
-  nh.param("k2", params.k2, 0.10996870793601);
-  nh.param("p1", params.p1, 0.000157303079833973);
-  nh.param("p2", params.p2, 0.000544930726278493);
-  nh.param("marker_size", params.marker_size, 0.2);
-  nh.param("delta_width_qr_center", params.delta_width_qr_center, 0.55);
-  nh.param("delta_height_qr_center", params.delta_height_qr_center, 0.35);
-  nh.param("delta_width_circles", params.delta_width_circles, 0.5);
-  nh.param("delta_height_circles", params.delta_height_circles, 0.4);
-  nh.param("min_detected_markers", params.min_detected_markers, 3);
-  nh.param("circle_radius", params.circle_radius, 0.12);
-  nh.param("annulus_half_width", params.annulus_half_width, 0.025);
-  nh.param("board_width", params.board_width, 1.4);
-  nh.param("board_height", params.board_height, 1.0);
-  nh.param("board_roi_margin", params.board_roi_margin, 0.08);
-  nh.param("board_roi_depth", params.board_roi_depth, 0.12);
-  nh.param("auto_roi_voxel_leaf", params.auto_roi_voxel_leaf, 0.01);
-  nh.param("annulus_voxel_leaf", params.annulus_voxel_leaf, 0.005);
-  nh.param("auto_roi_geometry_max_error", params.auto_roi_geometry_max_error, 0.10);
-  nh.param("image_path", params.image_path, string(""));
-  nh.param("bag_path", params.bag_path, string(""));
-  nh.param("lidar_topic", params.lidar_topic, string("/livox/lidar"));
+inline Params loadParameters(const std::string& config_path) {
+  Params params{};
+  params.camera_width = 0;
+  params.camera_height = 0;
+  params.fx = 1215.31801774424;
+  params.fy = 1214.72961288138;
+  params.cx = 1047.86571859677;
+  params.cy = 745.068353101898;
+  params.k1 = -0.33574781188503;
+  params.k2 = 0.10996870793601;
+  params.p1 = 0.000157303079833973;
+  params.p2 = 0.000544930726278493;
+  params.marker_size = 0.2;
+  params.delta_width_qr_center = 0.55;
+  params.delta_height_qr_center = 0.35;
+  params.delta_width_circles = 0.5;
+  params.delta_height_circles = 0.4;
+  params.min_detected_markers = 3;
+  params.circle_radius = 0.12;
+  params.annulus_half_width = 0.025;
+  params.board_width = 1.4;
+  params.board_height = 1.0;
+  params.board_roi_margin = 0.08;
+  params.board_roi_depth = 0.12;
+  params.auto_roi_voxel_leaf = 0.01;
+  params.annulus_voxel_leaf = 0.005;
+  params.auto_roi_geometry_max_error = 0.10;
+  params.image_path = "";
+  params.pcd_path = "";
+  params.lidar_forward_axis = "+x";
+  params.lidar_up_axis = "+z";
+  params.output_path = "output";
+  params.use_auto_lidar_roi = false;
+  params.x_min = 1.5;
+  params.x_max = 3.0;
+  params.y_min = -1.5;
+  params.y_max = 2.0;
+  params.z_min = -0.5;
+  params.z_max = 2.0;
 
-  // Prefer an explicit mounting-axis description.  The values answer
-  // "which signed LiDAR axis points forward/up?"; left is derived from the
-  // right-handed relation forward x left = up.
-  bool has_forward_axis = nh.getParam("lidar_forward_axis", params.lidar_forward_axis);
-  bool has_up_axis = nh.getParam("lidar_up_axis", params.lidar_up_axis);
+  if (!config_path.empty()) {
+    try {
+      const YAML::Node config = YAML::LoadFile(config_path);
+      auto set_if_present = [&](const char* key, auto& value) {
+        if (config[key]) value = config[key].as<std::decay_t<decltype(value)>>();
+      };
 
-  // Backward compatibility for configurations created before the mounting
-  // axes were user-configurable.  New configurations should not use this.
-  string legacy_sort_mode;
-  bool has_legacy_sort_mode = nh.getParam("lidar_sort_mode", legacy_sort_mode);
-  if (!has_forward_axis && !has_up_axis) {
-    if (has_legacy_sort_mode && legacy_sort_mode == "avia_roll_x_90") {
-      params.lidar_forward_axis = "+x";
-      params.lidar_up_axis = "-y";
-      ROS_WARN("[Config] 'lidar_sort_mode=avia_roll_x_90' is deprecated; use "
-               "'lidar_forward_axis=+x' and 'lidar_up_axis=-y'.");
-    } else {
-      params.lidar_forward_axis = "+x";
-      params.lidar_up_axis = "+z";
-      if (has_legacy_sort_mode && legacy_sort_mode != "standard") {
-        ROS_WARN_STREAM("[Config] Unknown deprecated lidar_sort_mode '"
-                        << legacy_sort_mode << "'; using the standard +X-forward/+Z-up mapping.");
-      } else if (has_legacy_sort_mode) {
-        ROS_WARN("[Config] 'lidar_sort_mode=standard' is deprecated; use "
-                 "'lidar_forward_axis=+x' and 'lidar_up_axis=+z'.");
+      set_if_present("camera_width", params.camera_width);
+      set_if_present("camera_height", params.camera_height);
+      set_if_present("fx", params.fx);
+      set_if_present("fy", params.fy);
+      set_if_present("cx", params.cx);
+      set_if_present("cy", params.cy);
+      set_if_present("k1", params.k1);
+      set_if_present("k2", params.k2);
+      set_if_present("p1", params.p1);
+      set_if_present("p2", params.p2);
+      set_if_present("marker_size", params.marker_size);
+      set_if_present("delta_width_qr_center", params.delta_width_qr_center);
+      set_if_present("delta_height_qr_center", params.delta_height_qr_center);
+      set_if_present("delta_width_circles", params.delta_width_circles);
+      set_if_present("delta_height_circles", params.delta_height_circles);
+      set_if_present("min_detected_markers", params.min_detected_markers);
+      set_if_present("circle_radius", params.circle_radius);
+      set_if_present("annulus_half_width", params.annulus_half_width);
+      set_if_present("board_width", params.board_width);
+      set_if_present("board_height", params.board_height);
+      set_if_present("board_roi_margin", params.board_roi_margin);
+      set_if_present("board_roi_depth", params.board_roi_depth);
+      set_if_present("auto_roi_voxel_leaf", params.auto_roi_voxel_leaf);
+      set_if_present("annulus_voxel_leaf", params.annulus_voxel_leaf);
+      set_if_present("auto_roi_geometry_max_error", params.auto_roi_geometry_max_error);
+      set_if_present("image_path", params.image_path);
+      set_if_present("pcd_path", params.pcd_path);
+      set_if_present("output_path", params.output_path);
+      set_if_present("use_auto_lidar_roi", params.use_auto_lidar_roi);
+      set_if_present("x_min", params.x_min);
+      set_if_present("x_max", params.x_max);
+      set_if_present("y_min", params.y_min);
+      set_if_present("y_max", params.y_max);
+      set_if_present("z_min", params.z_min);
+      set_if_present("z_max", params.z_max);
+
+      const bool has_forward_axis = static_cast<bool>(config["lidar_forward_axis"]);
+      const bool has_up_axis = static_cast<bool>(config["lidar_up_axis"]);
+      const bool has_legacy_sort_mode = static_cast<bool>(config["lidar_sort_mode"]);
+      const std::string legacy_sort_mode = has_legacy_sort_mode
+          ? config["lidar_sort_mode"].as<std::string>() : std::string();
+
+      if (!has_forward_axis && !has_up_axis) {
+        if (has_legacy_sort_mode && legacy_sort_mode == "avia_roll_x_90") {
+          params.lidar_forward_axis = "+x";
+          params.lidar_up_axis = "-y";
+          ROS_WARN("[Config] 'lidar_sort_mode=avia_roll_x_90' is deprecated; use 'lidar_forward_axis=+x' and 'lidar_up_axis=-y'.");
+        } else {
+          params.lidar_forward_axis = "+x";
+          params.lidar_up_axis = "+z";
+          if (has_legacy_sort_mode && legacy_sort_mode != "standard") {
+            ROS_WARN_STREAM("[Config] Unknown deprecated lidar_sort_mode '" << legacy_sort_mode
+                            << "'; using the standard +X-forward/+Z-up mapping.");
+          } else if (has_legacy_sort_mode) {
+            ROS_WARN("[Config] 'lidar_sort_mode=standard' is deprecated; use 'lidar_forward_axis=+x' and 'lidar_up_axis=+z'.");
+          }
+        }
+      } else if (has_forward_axis != has_up_axis) {
+        if (!has_forward_axis) params.lidar_forward_axis.clear();
+        if (!has_up_axis) params.lidar_up_axis.clear();
+        ROS_ERROR("[Config] lidar_forward_axis and lidar_up_axis must be set together.");
+      } else {
+        set_if_present("lidar_forward_axis", params.lidar_forward_axis);
+        set_if_present("lidar_up_axis", params.lidar_up_axis);
+        if (has_legacy_sort_mode) {
+          ROS_WARN("[Config] Ignoring deprecated lidar_sort_mode because explicit lidar_forward_axis/lidar_up_axis are configured.");
+        }
       }
+    } catch (const std::exception& e) {
+      ROS_ERROR("[Config] Failed to load YAML config %s: %s", config_path.c_str(), e.what());
     }
-  } else if (has_forward_axis != has_up_axis) {
-    // Leave the missing value empty.  sortPatternCenters() will reject the
-    // incomplete pair instead of silently choosing an unintended mounting.
-    if (!has_forward_axis) params.lidar_forward_axis.clear();
-    if (!has_up_axis) params.lidar_up_axis.clear();
-    ROS_ERROR("[Config] lidar_forward_axis and lidar_up_axis must be set together.");
-  } else if (has_legacy_sort_mode) {
-    ROS_WARN("[Config] Ignoring deprecated lidar_sort_mode because explicit "
-             "lidar_forward_axis/lidar_up_axis are configured.");
   }
 
-  nh.param("output_path", params.output_path, string("/tmp/fast_calib_output"));
-  nh.param("use_auto_lidar_roi", params.use_auto_lidar_roi, false);
-  nh.param("x_min", params.x_min, 1.5);
-  nh.param("x_max", params.x_max, 3.0);
-  nh.param("y_min", params.y_min, -1.5);
-  nh.param("y_max", params.y_max, 2.0);
-  nh.param("z_min", params.z_min, -0.5);
-  nh.param("z_max", params.z_max, 2.0);
   return params;
 }
 
@@ -217,11 +276,6 @@ bool ensureDirectoryTree(const std::string& path, std::string& error)
     error = "output_path must not be empty";
     return false;
   }
-  if (path.find("$(") != std::string::npos) {
-    error = "output_path contains an unexpanded ROS substitution: " + path;
-    return false;
-  }
-
   std::string current;
   current.reserve(path.size());
   for (std::size_t i = 0; i < path.size(); ++i) {

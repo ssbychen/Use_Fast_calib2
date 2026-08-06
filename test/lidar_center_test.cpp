@@ -10,144 +10,96 @@ Standalone LiDAR-only batch test entry for target annulus center extraction.
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
-#include <rosbag/bag.h>
-#include <rosbag/view.h>
+#include <limits>
+#include <pcl/PCLPointCloud2.h>
 #include <pcl/io/pcd_io.h>
-#include <pcl/filters/impl/extract_indices.hpp>
-#include <pcl/filters/impl/filter.hpp>
-#include <pcl/filters/impl/filter_indices.hpp>
-#include <pcl/filters/impl/passthrough.hpp>
-#include <pcl/filters/impl/voxel_grid.hpp>
-#include <pcl/impl/pcl_base.hpp>
-#include <pcl/segmentation/impl/extract_clusters.hpp>
-#include <pcl/segmentation/impl/sac_segmentation.hpp>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/point_cloud2_iterator.h>
 #include <sys/stat.h>
 
 namespace
 {
-// 判断 PointCloud2 消息中是否包含指定字段
-bool hasField(const sensor_msgs::PointCloud2& msg, const std::string& name)
-{
-    for (const auto& field : msg.fields)
-    {
-        if (field.name == name) return true;
-    }
-    return false;
-}
-
-// 从 rosbag 中读取指定 LiDAR topic，并统一转换为 Common::Point 点云
-bool loadCloudFromBag(const std::string& bag_path,
-                      const std::string& lidar_topic,
+bool loadCloudFromPcd(const std::string& pcd_path,
                       pcl::PointCloud<Common::Point>::Ptr cloud,
                       LiDARType& detected_type)
 {
-    cloud->clear();
-    detected_type = LiDARType::Unknown;
+    Params params;
+    params.image_path = "";
+    params.pcd_path = pcd_path;
 
-    rosbag::Bag bag;
-    try
+    pcl::PCLPointCloud2 cloud2;
+    if (pcl::io::loadPCDFile(pcd_path, cloud2) < 0)
     {
-        bag.open(bag_path, rosbag::bagmode::Read);
-    }
-    catch (const rosbag::BagException& e)
-    {
-        ROS_ERROR_STREAM("[LiDAR Test] Failed to open bag " << bag_path << ": " << e.what());
+        ROS_ERROR("[LiDAR Test] Failed to load PCD: %s", pcd_path.c_str());
         return false;
     }
 
-    rosbag::View view(bag, rosbag::TopicQuery(std::vector<std::string>{lidar_topic}));
-    size_t message_count = 0;
-
-    for (const rosbag::MessageInstance& m : view)
+    auto find_field = [&](const std::string& name) -> const pcl::PCLPointField*
     {
-        if (auto livox_custom_msg = m.instantiate<livox_ros_driver::CustomMsg>())
+        for (const auto& field : cloud2.fields)
         {
-            detected_type = LiDARType::Solid;
-            cloud->reserve(cloud->size() + livox_custom_msg->point_num);
-            for (uint32_t i = 0; i < livox_custom_msg->point_num; ++i)
-            {
-                Common::Point p;
-                p.x = livox_custom_msg->points[i].x;
-                p.y = livox_custom_msg->points[i].y;
-                p.z = livox_custom_msg->points[i].z;
-                p.intensity = static_cast<float>(livox_custom_msg->points[i].reflectivity);
-                p.ring = static_cast<std::uint16_t>(livox_custom_msg->points[i].line);
-                p.scan_id = static_cast<std::uint32_t>(message_count);
-                cloud->push_back(p);
-            }
-            ++message_count;
-            continue;
+            if (field.name == name) return &field;
         }
-
-        if (auto pcl_msg = m.instantiate<sensor_msgs::PointCloud2>())
+        return nullptr;
+    };
+    auto read_numeric_field = [&](const pcl::PCLPointField& field, std::size_t point_index) -> double
+    {
+        const std::size_t offset = point_index * cloud2.point_step + field.offset;
+        const std::uint8_t* ptr = cloud2.data.data() + offset;
+        switch (field.datatype)
         {
-            const bool has_ring = hasField(*pcl_msg, "ring");
-            const bool has_intensity = hasField(*pcl_msg, "intensity");
-            const bool has_reflectivity = hasField(*pcl_msg, "reflectivity");
-
-            if (detected_type == LiDARType::Unknown)
-            {
-                detected_type = has_ring ? LiDARType::Mech : LiDARType::Solid;
-            }
-
-            sensor_msgs::PointCloud2ConstIterator<float> it_x(*pcl_msg, "x");
-            sensor_msgs::PointCloud2ConstIterator<float> it_y(*pcl_msg, "y");
-            sensor_msgs::PointCloud2ConstIterator<float> it_z(*pcl_msg, "z");
-
-            std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<std::uint16_t>> it_ring_ptr;
-            if (has_ring)
-            {
-                it_ring_ptr.reset(new sensor_msgs::PointCloud2ConstIterator<std::uint16_t>(*pcl_msg, "ring"));
-            }
-
-            std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> it_intensity_ptr;
-            if (has_intensity)
-            {
-                it_intensity_ptr.reset(new sensor_msgs::PointCloud2ConstIterator<float>(*pcl_msg, "intensity"));
-            }
-            else if (has_reflectivity)
-            {
-                it_intensity_ptr.reset(new sensor_msgs::PointCloud2ConstIterator<float>(*pcl_msg, "reflectivity"));
-            }
-
-            const size_t n = static_cast<size_t>(pcl_msg->width) * pcl_msg->height;
-            cloud->reserve(cloud->size() + n);
-            for (size_t i = 0; i < n; ++i, ++it_x, ++it_y, ++it_z)
-            {
-                Common::Point p;
-                p.x = *it_x;
-                p.y = *it_y;
-                p.z = *it_z;
-                p.ring = 0xFFFF;
-                p.intensity = 0.0f;
-
-                if (it_ring_ptr)
-                {
-                    p.ring = **it_ring_ptr;
-                    ++(*it_ring_ptr);
-                }
-                if (it_intensity_ptr)
-                {
-                    p.intensity = **it_intensity_ptr;
-                    ++(*it_intensity_ptr);
-                }
-                p.scan_id = static_cast<std::uint32_t>(message_count);
-
-                cloud->push_back(p);
-            }
-            ++message_count;
+            case pcl::PCLPointField::INT8: return static_cast<double>(*reinterpret_cast<const std::int8_t*>(ptr));
+            case pcl::PCLPointField::UINT8: return static_cast<double>(*reinterpret_cast<const std::uint8_t*>(ptr));
+            case pcl::PCLPointField::INT16: return static_cast<double>(*reinterpret_cast<const std::int16_t*>(ptr));
+            case pcl::PCLPointField::UINT16: return static_cast<double>(*reinterpret_cast<const std::uint16_t*>(ptr));
+            case pcl::PCLPointField::INT32: return static_cast<double>(*reinterpret_cast<const std::int32_t*>(ptr));
+            case pcl::PCLPointField::UINT32: return static_cast<double>(*reinterpret_cast<const std::uint32_t*>(ptr));
+            case pcl::PCLPointField::FLOAT32: return static_cast<double>(*reinterpret_cast<const float*>(ptr));
+            case pcl::PCLPointField::FLOAT64: return *reinterpret_cast<const double*>(ptr);
+            default: return std::numeric_limits<double>::quiet_NaN();
         }
+    };
+
+    const auto* x_field = find_field("x");
+    const auto* y_field = find_field("y");
+    const auto* z_field = find_field("z");
+    const auto* ring_field = find_field("ring");
+    const auto* intensity_field = find_field("intensity");
+    const auto* reflectivity_field = find_field("reflectivity");
+    const auto* scan_id_field = find_field("scan_id");
+    if (!x_field || !y_field || !z_field)
+    {
+        ROS_ERROR("[LiDAR Test] PCD is missing x/y/z fields: %s", pcd_path.c_str());
+        return false;
     }
 
-    ROS_INFO("[LiDAR Test] Loaded %zu messages, %zu points from %s",
-             message_count, cloud->size(), bag_path.c_str());
-    return message_count > 0 && !cloud->empty();
+    detected_type = ring_field ? LiDARType::Mech : LiDARType::Solid;
+    cloud->clear();
+    const std::size_t point_count = static_cast<std::size_t>(cloud2.width) * static_cast<std::size_t>(cloud2.height);
+    cloud->reserve(point_count);
+    for (std::size_t i = 0; i < point_count; ++i)
+    {
+        Common::Point p;
+        p.x = static_cast<float>(read_numeric_field(*x_field, i));
+        p.y = static_cast<float>(read_numeric_field(*y_field, i));
+        p.z = static_cast<float>(read_numeric_field(*z_field, i));
+        if (intensity_field)
+        {
+            p.intensity = static_cast<float>(read_numeric_field(*intensity_field, i));
+        }
+        else if (reflectivity_field)
+        {
+            p.intensity = static_cast<float>(read_numeric_field(*reflectivity_field, i));
+        }
+        p.ring = ring_field ? static_cast<std::uint16_t>(read_numeric_field(*ring_field, i)) : 0;
+        p.scan_id = scan_id_field ? static_cast<std::uint32_t>(read_numeric_field(*scan_id_field, i)) : 0;
+        cloud->push_back(p);
+    }
+
+    ROS_INFO("[LiDAR Test] Loaded %zu points from %s", cloud->size(), pcd_path.c_str());
+    return !cloud->empty();
 }
 
-// 将 LiDAR 类型枚举转换为日志可读字符串
 std::string lidarTypeName(LiDARType type)
 {
     switch (type)
@@ -158,7 +110,6 @@ std::string lidarTypeName(LiDARType type)
     }
 }
 
-// 去掉路径末尾多余的斜杠
 std::string trimTrailingSlash(std::string path)
 {
     while (!path.empty() && path.back() == '/')
@@ -168,7 +119,6 @@ std::string trimTrailingSlash(std::string path)
     return path;
 }
 
-// 获取路径最后一级文件名或目录名
 std::string pathBaseName(const std::string& path)
 {
     const std::string clean_path = trimTrailingSlash(path);
@@ -176,7 +126,6 @@ std::string pathBaseName(const std::string& path)
     return pos == std::string::npos ? clean_path : clean_path.substr(pos + 1);
 }
 
-// 获取路径父目录的最后一级名称
 std::string pathParentName(const std::string& path)
 {
     const std::string clean_path = trimTrailingSlash(path);
@@ -185,14 +134,12 @@ std::string pathParentName(const std::string& path)
     return pathBaseName(clean_path.substr(0, last_slash));
 }
 
-// 去掉文件名扩展名
 std::string stripExtension(const std::string& filename)
 {
     const size_t pos = filename.find_last_of('.');
     return pos == std::string::npos ? filename : filename.substr(0, pos);
 }
 
-// 将任意字符串转换为安全的文件名前缀片段
 std::string sanitizeFilePart(std::string value)
 {
     for (char& c : value)
@@ -205,14 +152,9 @@ std::string sanitizeFilePart(std::string value)
     return value;
 }
 
-// 解析测试输出目录，兼容未展开的 ROS launch 变量
 std::string resolveOutputDirectory(const Params& params)
 {
-    std::string output_dir = params.output_path;
-    if (output_dir.empty() || output_dir.find("$(") != std::string::npos)
-    {
-        output_dir = "/tmp/fast_calib_output";
-    }
+    std::string output_dir = params.output_path.empty() ? "output" : params.output_path;
     output_dir = trimTrailingSlash(output_dir);
     std::string error;
     if (!ensureDirectoryTree(output_dir, error))
@@ -222,14 +164,12 @@ std::string resolveOutputDirectory(const Params& params)
     return output_dir;
 }
 
-// 根据 bag 所在目录和文件名生成输出文件前缀
-std::string outputPrefixForBag(const std::string& bag_path)
+std::string outputPrefixForPcd(const std::string& pcd_path)
 {
-    return sanitizeFilePart(pathParentName(bag_path) + "_" +
-                            stripExtension(pathBaseName(bag_path)));
+    return sanitizeFilePart(pathParentName(pcd_path) + "_" +
+                            stripExtension(pathBaseName(pcd_path)));
 }
 
-// 构造带 RGB 颜色的 PCL 点
 pcl::PointXYZRGB makeRgbPoint(float x, float y, float z, std::uint8_t r, std::uint8_t g, std::uint8_t b)
 {
     pcl::PointXYZRGB p;
@@ -242,7 +182,6 @@ pcl::PointXYZRGB makeRgbPoint(float x, float y, float z, std::uint8_t r, std::ui
     return p;
 }
 
-// 在线性颜色表中按比例插值
 std::array<std::uint8_t, 3> lerpColor(const std::array<std::uint8_t, 3>& a,
                                       const std::array<std::uint8_t, 3>& b,
                                       float t)
@@ -255,7 +194,6 @@ std::array<std::uint8_t, 3> lerpColor(const std::array<std::uint8_t, 3>& a,
     }};
 }
 
-// 计算浮点数组的指定分位数
 float percentile(std::vector<float> values, float ratio)
 {
     if (values.empty()) return 0.0f;
@@ -265,7 +203,6 @@ float percentile(std::vector<float> values, float ratio)
     return values[idx];
 }
 
-// 将 intensity 映射为便于观察的伪彩色
 std::array<std::uint8_t, 3> intensityColor(float intensity, float min_intensity, float max_intensity)
 {
     float t = 0.0f;
@@ -286,7 +223,6 @@ std::array<std::uint8_t, 3> intensityColor(float intensity, float min_intensity,
     return lerpColor(mid, high, (t - 0.55f) / 0.45f);
 }
 
-// 在调试点云中生成实心球标记
 void addSphereMarker(const pcl::PointXYZ& center,
                      float radius,
                      float step,
@@ -309,7 +245,6 @@ void addSphereMarker(const pcl::PointXYZ& center,
     }
 }
 
-// 用纯白小球标记最终圆心
 void addCenterMarker(const pcl::PointXYZ& center,
                      const std::array<std::uint8_t, 3>& color,
                      pcl::PointCloud<pcl::PointXYZRGB>::Ptr output)
@@ -317,16 +252,15 @@ void addCenterMarker(const pcl::PointXYZ& center,
     addSphereMarker(center, 0.040f, 0.006f, color, output);
 }
 
-// 保存调试 PCD：板子按 intensity 着色，annulus 为绿色，边界为红色，圆心为白色
 bool saveDebugCloud(const pcl::PointCloud<Common::Point>::Ptr& board_cloud,
                     const pcl::PointCloud<Common::Point>::Ptr& annulus_cloud,
                     const pcl::PointCloud<pcl::PointXYZ>::Ptr& boundary_cloud,
                     const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers,
                     const Params& params,
-                    const std::string& bag_path)
+                    const std::string& pcd_path)
 {
     const std::string output_dir = resolveOutputDirectory(params);
-    const std::string prefix = outputPrefixForBag(bag_path);
+    const std::string prefix = outputPrefixForPcd(pcd_path);
     const std::string output_path = output_dir + "/" + prefix + "_debug_cloud.pcd";
 
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr debug_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
@@ -417,7 +351,7 @@ bool saveDebugCloud(const pcl::PointCloud<Common::Point>::Ptr& board_cloud,
 
     if (debug_cloud->empty())
     {
-        ROS_WARN_STREAM("[LiDAR Test] Skip saving empty debug cloud for " << bag_path);
+        ROS_WARN_STREAM("[LiDAR Test] Skip saving empty debug cloud for " << pcd_path);
         return false;
     }
 
@@ -440,13 +374,12 @@ bool saveDebugCloud(const pcl::PointCloud<Common::Point>::Ptr& board_cloud,
     return true;
 }
 
-// 保存最终圆心坐标到 output 文本文件
 bool saveCenterCoordinates(const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers,
                            const Params& params,
-                           const std::string& bag_path)
+                           const std::string& pcd_path)
 {
     const std::string output_dir = resolveOutputDirectory(params);
-    const std::string output_path = output_dir + "/" + outputPrefixForBag(bag_path) + "_centers.txt";
+    const std::string output_path = output_dir + "/" + outputPrefixForPcd(pcd_path) + "_centers.txt";
 
     std::ofstream fout(output_path);
     if (!fout.is_open())
@@ -467,7 +400,6 @@ bool saveCenterCoordinates(const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers,
     return true;
 }
 
-// 计算 double 数组的指定分位数
 double quantileDouble(std::vector<double> values, double ratio)
 {
     if (values.empty()) return std::numeric_limits<double>::quiet_NaN();
@@ -477,7 +409,6 @@ double quantileDouble(std::vector<double> values, double ratio)
     return values[idx];
 }
 
-// 输出固态 LiDAR 单圆半径质检统计
 void printSolidRadiusQuality(const std::array<std::vector<double>, TARGET_NUM_CIRCLES>& radii_by_center,
                              double target_radius)
 {
@@ -520,7 +451,6 @@ void printSolidRadiusQuality(const std::array<std::vector<double>, TARGET_NUM_CI
               << " mm, RMSE = " << rmse * 1000.0 << " mm" << std::endl;
 }
 
-// 输出机械 LiDAR 内外边界半径和环宽质检统计
 void printMechanicalRadiusQuality(
     const std::array<std::vector<double>, TARGET_NUM_CIRCLES>& inner_radii_by_center,
     const std::array<std::vector<double>, TARGET_NUM_CIRCLES>& outer_radii_by_center,
@@ -586,7 +516,6 @@ void printMechanicalRadiusQuality(
               << " mm" << std::endl;
 }
 
-// 根据提取到的 annulus/边界点统计半径误差，用作圆心几何质检之外的辅助检查
 void validateRadiusQuality(const pcl::PointCloud<pcl::PointXYZ>::Ptr& edge_cloud,
                            const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers_z0,
                            const Params& params,
@@ -682,33 +611,30 @@ void validateRadiusQuality(const pcl::PointCloud<pcl::PointXYZ>::Ptr& edge_cloud
 
 }  // namespace
 
-// LiDAR 圆心提取批量测试入口
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "lidar_center_test");
-    ros::NodeHandle nh;
-
-    if (argc < 3)
+    if (argc < 2)
     {
-        std::cerr << "Usage: rosrun fast_calib lidar_center_test <bag_path> <lidar_topic> "
-                     "[auto|solid|mech] [forward_axis up_axis]" << std::endl;
+        std::cerr << "Usage: " << argv[0]
+                  << " <pcd_path> [auto|solid|mech] [forward_axis up_axis] [config_path]" << std::endl;
         return 2;
     }
 
-    Params params = loadParameters(nh);
-    params.bag_path = argv[1];
-    params.lidar_topic = argv[2];
+    const std::string pcd_path = argv[1];
+    const std::string mode = argc >= 3 ? argv[2] : "auto";
 
-    const std::string mode = argc >= 4 ? argv[3] : "auto";
-    if (argc == 5 || argc > 6)
+    Params params = loadParameters(argc >= 6 ? argv[5] : std::string());
+    params.pcd_path = pcd_path;
+
+    if (argc == 4 || argc > 6)
     {
         std::cerr << "Both forward_axis and up_axis must be provided, for example: +x -y" << std::endl;
         return 2;
     }
-    if (argc == 6)
+    if (argc >= 5)
     {
-        params.lidar_forward_axis = argv[4];
-        params.lidar_up_axis = argv[5];
+        params.lidar_forward_axis = argv[3];
+        params.lidar_up_axis = argv[4];
     }
 
     std::string mounting_error;
@@ -722,7 +648,7 @@ int main(int argc, char** argv)
 
     pcl::PointCloud<Common::Point>::Ptr cloud(new pcl::PointCloud<Common::Point>);
     LiDARType detected_type = LiDARType::Unknown;
-    if (!loadCloudFromBag(params.bag_path, params.lidar_topic, cloud, detected_type))
+    if (!loadCloudFromPcd(params.pcd_path, cloud, detected_type))
     {
         return 1;
     }
@@ -731,12 +657,11 @@ int main(int argc, char** argv)
     if (mode == "solid") run_type = LiDARType::Solid;
     if (mode == "mech") run_type = LiDARType::Mech;
 
-    std::cout << "[LiDAR Test] Bag: " << params.bag_path << std::endl;
-    std::cout << "[LiDAR Test] Topic: " << params.lidar_topic << std::endl;
+    std::cout << "[LiDAR Test] PCD: " << params.pcd_path << std::endl;
     std::cout << "[LiDAR Test] Detected type: " << lidarTypeName(detected_type)
               << ", run type: " << lidarTypeName(run_type) << std::endl;
 
-    LidarDetect lidar_detect(nh, params);
+    LidarDetect lidar_detect(params);
     pcl::PointCloud<pcl::PointXYZ>::Ptr raw_centers(new pcl::PointCloud<pcl::PointXYZ>);
 
     if (run_type == LiDARType::Solid)
@@ -772,10 +697,10 @@ int main(int argc, char** argv)
     }
     validateTargetGeometry(centers, params.delta_width_circles, params.delta_height_circles, "LiDAR");
     validateRadiusQuality(lidar_detect.getEdgeCloud(), lidar_detect.getCenterZ0Cloud(), params, run_type);
-    saveCenterCoordinates(centers, params, params.bag_path);
+    saveCenterCoordinates(centers, params, params.pcd_path);
     saveDebugCloud(lidar_detect.getPlaneCloud(), lidar_detect.getAnnulusOriginalCloud(),
                    lidar_detect.getBoundaryOriginalCloud(),
-                   centers, params, params.bag_path);
+                   centers, params, params.pcd_path);
 
     return centers->size() == TARGET_NUM_CIRCLES ? 0 : 1;
 }

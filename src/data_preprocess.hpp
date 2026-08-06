@@ -8,32 +8,61 @@ which is included as part of this source code package.
 #ifndef DATA_PREPROCESS_HPP
 #define DATA_PREPROCESS_HPP
 
-#include "CustomMsg.h"
 #include <Eigen/Core>
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/conversions.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl_conversions/pcl_conversions.h>
-#include <ros/ros.h>
-#include <rosbag/bag.h>
-#include <rosbag/view.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/point_cloud2_iterator.h>
-#include <fstream>
+#include <limits>
+#include <vector>
 #include "common_lib.h"
 
 using namespace std;
 
 enum class LiDARType : int {
     Unknown = 0,
-    Solid   = 1,   // 固态（如 Livox）
-    Mech    = 2    // 机械式多线
+    Solid   = 1,
+    Mech    = 2
 };
 
 class DataPreprocess
 {
+private:
+    static const pcl::PCLPointField* findField(const pcl::PCLPointCloud2& cloud, const std::string& name)
+    {
+        for (const auto& field : cloud.fields)
+        {
+            if (field.name == name) return &field;
+        }
+        return nullptr;
+    }
+
+    static double readNumericField(const pcl::PCLPointCloud2& cloud, const pcl::PCLPointField& field, std::size_t point_index)
+    {
+        const std::size_t point_step = cloud.point_step;
+        const std::size_t offset = point_index * point_step + field.offset;
+        if (offset >= cloud.data.size())
+        {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+
+        const std::uint8_t* ptr = cloud.data.data() + offset;
+        switch (field.datatype)
+        {
+            case pcl::PCLPointField::INT8:   return static_cast<double>(*reinterpret_cast<const std::int8_t*>(ptr));
+            case pcl::PCLPointField::UINT8:  return static_cast<double>(*reinterpret_cast<const std::uint8_t*>(ptr));
+            case pcl::PCLPointField::INT16:  return static_cast<double>(*reinterpret_cast<const std::int16_t*>(ptr));
+            case pcl::PCLPointField::UINT16: return static_cast<double>(*reinterpret_cast<const std::uint16_t*>(ptr));
+            case pcl::PCLPointField::INT32:  return static_cast<double>(*reinterpret_cast<const std::int32_t*>(ptr));
+            case pcl::PCLPointField::UINT32: return static_cast<double>(*reinterpret_cast<const std::uint32_t*>(ptr));
+            case pcl::PCLPointField::FLOAT32:return static_cast<double>(*reinterpret_cast<const float*>(ptr));
+            case pcl::PCLPointField::FLOAT64:return *reinterpret_cast<const double*>(ptr);
+            default: return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
 public:
-    // 改成带线号的点云
     pcl::PointCloud<Common::Point>::Ptr cloud_input_;
     cv::Mat img_input_;
     LiDARType lidar_type_{LiDARType::Unknown};
@@ -42,152 +71,67 @@ public:
     DataPreprocess(Params &params)
         : cloud_input_(new pcl::PointCloud<Common::Point>)
     {
-        string bag_path   = params.bag_path;
-        string image_path = params.image_path;
-        string lidar_topic = params.lidar_topic;
-
-        // 读图像
-        img_input_ = cv::imread(image_path, cv::IMREAD_UNCHANGED);
+        img_input_ = cv::imread(params.image_path, cv::IMREAD_UNCHANGED);
         if (img_input_.empty())
         {
-            std::string msg = "Loading the image " + image_path + " failed";
-            ROS_ERROR_STREAM(msg.c_str());
+            std::cerr << "[DataPreprocess] Failed to load image: " << params.image_path << std::endl;
             return;
         }
 
-        // 先检查包是否存在
-        std::fstream file_;
-        file_.open(bag_path, ios::in);
-        if (!file_)
+        pcl::PCLPointCloud2 cloud2;
+        if (pcl::io::loadPCDFile(params.pcd_path, cloud2) < 0)
         {
-            std::string msg = "Loading the rosbag " + bag_path + " failed";
-            ROS_ERROR_STREAM(msg.c_str());
-            return;
-        }
-        ROS_INFO("Loading the rosbag %s", bag_path.c_str());
-
-        rosbag::Bag bag;
-        try {
-            bag.open(bag_path, rosbag::bagmode::Read);
-        } catch (rosbag::BagException &e) {
-            ROS_ERROR_STREAM("LOADING BAG FAILED: " << e.what());
+            std::cerr << "[DataPreprocess] Failed to load PCD: " << params.pcd_path << std::endl;
             return;
         }
 
-        std::vector<string> lidar_topic_vec = {lidar_topic};
-        rosbag::View view(bag, rosbag::TopicQuery(lidar_topic_vec));
-        std::uint32_t scan_id = 0;
+        const auto* x_field = findField(cloud2, "x");
+        const auto* y_field = findField(cloud2, "y");
+        const auto* z_field = findField(cloud2, "z");
+        const auto* ring_field = findField(cloud2, "ring");
+        const auto* intensity_field = findField(cloud2, "intensity");
+        const auto* reflectivity_field = findField(cloud2, "reflectivity");
+        const auto* scan_id_field = findField(cloud2, "scan_id");
 
-        // 累计读取
-        for (const rosbag::MessageInstance &m : view)
+        if (!x_field || !y_field || !z_field)
         {
-            // 1) Livox 自定义消息（含 line 字段）
-            if (auto livox_custom_msg = m.instantiate<livox_ros_driver::CustomMsg>())
-            {
-                const std::uint32_t current_scan_id = scan_id++;
-                lidar_type_ = LiDARType::Solid;
-                cloud_input_->reserve(cloud_input_->size() + livox_custom_msg->point_num);
-                for (uint32_t i = 0; i < livox_custom_msg->point_num; ++i)
-                {
-                    Common::Point p;
-                    p.x = livox_custom_msg->points[i].x;
-                    p.y = livox_custom_msg->points[i].y;
-                    p.z = livox_custom_msg->points[i].z;
-                    p.intensity = static_cast<float>(livox_custom_msg->points[i].reflectivity);
-                    // Livox 的 CustomPoint 有 line 字段（uint8 / uint16 视版本而定）
-                    p.ring = static_cast<std::uint16_t>(livox_custom_msg->points[i].line);
-                    p.scan_id = current_scan_id;
-                    cloud_input_->push_back(p);
-                }
-                continue;
-            }
-
-            // 2) 机械雷达 / 通用 PointCloud2
-            if (auto pcl_msg = m.instantiate<sensor_msgs::PointCloud2>())
-            {
-                const std::uint32_t current_scan_id = scan_id++;
-                // 优先判断是否有 ring 字段
-                bool has_ring = false;
-                bool has_intensity = false;
-                bool has_reflectivity = false;
-                for (const auto &f : pcl_msg->fields)
-                {
-                    // if (f.name == "ring") { has_ring = true; break; }
-                    if (f.name == "ring") has_ring = true;
-                    if (f.name == "intensity") has_intensity = true;
-                    if (f.name == "reflectivity") has_reflectivity = true;
-                }
-
-                // 使用 iterator 安全读取
-                sensor_msgs::PointCloud2ConstIterator<float> it_x(*pcl_msg, "x");
-                sensor_msgs::PointCloud2ConstIterator<float> it_y(*pcl_msg, "y");
-                sensor_msgs::PointCloud2ConstIterator<float> it_z(*pcl_msg, "z");
-
-                // ring 可能不存在：不存在时用 0xFFFF 表示未知
-                std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<std::uint16_t>> it_ring_ptr;
-                std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> it_intensity_ptr;
-                if (has_ring)
-                {
-                    it_ring_ptr.reset(new sensor_msgs::PointCloud2ConstIterator<std::uint16_t>(*pcl_msg, "ring"));
-                    lidar_type_ = LiDARType::Mech;
-                }
-                else
-                {
-                    lidar_type_ = LiDARType::Solid;
-                }
-                if (has_intensity)
-                {
-                    it_intensity_ptr.reset(new sensor_msgs::PointCloud2ConstIterator<float>(*pcl_msg, "intensity"));
-                }
-                else if (has_reflectivity)
-                {
-                    it_intensity_ptr.reset(new sensor_msgs::PointCloud2ConstIterator<float>(*pcl_msg, "reflectivity"));
-                }
-
-                const size_t n = static_cast<size_t>(pcl_msg->width) * pcl_msg->height;
-                cloud_input_->reserve(cloud_input_->size() + n);
-
-                // cout << "Loading PointCloud2 with " << n << " points. Has ring: " << has_ring << endl;
-
-                for (size_t i = 0; i < n; ++i, ++it_x, ++it_y, ++it_z)
-                {
-                    Common::Point p;
-                    p.x = *it_x;
-                    p.y = *it_y;
-                    p.z = *it_z;
-
-                    if (has_ring)
-                    {
-                        // 解引用 ring 迭代器并前进
-                        p.ring = **it_ring_ptr;
-                        ++(*it_ring_ptr);
-                        // if (i % 32 == 0) cout << "ring: " << p.ring << endl;
-                        // if (i % 32 == 1) cout << "ring: " << p.ring << endl;
-                    }
-                    else
-                    {
-                        p.ring = 0xFFFF; // 未知线号
-                    }
-                    if (it_intensity_ptr)
-                    {
-                        p.intensity = **it_intensity_ptr;
-                        ++(*it_intensity_ptr);
-                    }
-                    else
-                    {
-                        p.intensity = 0.0f;
-                    }
-                    p.scan_id = current_scan_id;
-
-                    cloud_input_->push_back(p);
-                }
-                continue;
-            }
-
-            // 其他类型忽略
+            std::cerr << "[DataPreprocess] PCD is missing x/y/z fields: " << params.pcd_path << std::endl;
+            return;
         }
 
-        ROS_INFO("Loaded %zu points from the rosbag.", cloud_input_->size());
+        lidar_type_ = ring_field ? LiDARType::Mech : LiDARType::Solid;
+
+        const std::size_t point_count = static_cast<std::size_t>(cloud2.width) * static_cast<std::size_t>(cloud2.height);
+        cloud_input_->reserve(point_count);
+        for (std::size_t i = 0; i < point_count; ++i)
+        {
+            Common::Point p;
+            p.x = static_cast<float>(readNumericField(cloud2, *x_field, i));
+            p.y = static_cast<float>(readNumericField(cloud2, *y_field, i));
+            p.z = static_cast<float>(readNumericField(cloud2, *z_field, i));
+            if (intensity_field)
+            {
+                p.intensity = static_cast<float>(readNumericField(cloud2, *intensity_field, i));
+            }
+            else if (reflectivity_field)
+            {
+                p.intensity = static_cast<float>(readNumericField(cloud2, *reflectivity_field, i));
+            }
+            else
+            {
+                p.intensity = 0.0f;
+            }
+            p.ring = ring_field
+                ? static_cast<std::uint16_t>(readNumericField(cloud2, *ring_field, i))
+                : 0;
+            p.scan_id = scan_id_field
+                ? static_cast<std::uint32_t>(readNumericField(cloud2, *scan_id_field, i))
+                : 0;
+            cloud_input_->push_back(p);
+        }
+
+        std::cout << "[DataPreprocess] Loaded " << cloud_input_->size()
+                  << " points from " << params.pcd_path << std::endl;
     }
 };
 

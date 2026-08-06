@@ -1,9 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <filesystem>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
 #include "common_lib.h"
@@ -127,21 +126,16 @@ TEST(CameraCalibration, RequiresMatchingResolution)
 
 TEST(OutputDirectory, CreatesMissingParents)
 {
-  const std::string root =
-      "/tmp/fast_calib_common_lib_test_" + std::to_string(static_cast<long long>(::getpid()));
-  const std::string first = root + "/first";
-  const std::string nested = first + "/second";
+  const std::filesystem::path root =
+      std::filesystem::current_path() / "fast_calib_common_lib_test_output";
+  const std::filesystem::path nested = root / "first" / "second";
+  std::filesystem::remove_all(root);
 
   std::string error;
-  ASSERT_TRUE(ensureDirectoryTree(nested, error)) << error;
+  ASSERT_TRUE(ensureDirectoryTree(nested.string(), error)) << error;
+  ASSERT_TRUE(std::filesystem::is_directory(nested));
 
-  struct stat status;
-  ASSERT_EQ(::stat(nested.c_str(), &status), 0);
-  EXPECT_TRUE(S_ISDIR(status.st_mode));
-
-  EXPECT_EQ(::rmdir(nested.c_str()), 0);
-  EXPECT_EQ(::rmdir(first.c_str()), 0);
-  EXPECT_EQ(::rmdir(root.c_str()), 0);
+  std::filesystem::remove_all(root);
 }
 
 int main(int argc, char** argv)
