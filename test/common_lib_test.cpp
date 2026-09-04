@@ -125,6 +125,85 @@ TEST(CameraCalibration, RequiresMatchingResolution)
   EXPECT_FALSE(validateCameraCalibrationForImage(params, 2448, 2048, error));
 }
 
+TEST(TargetLayout, GeneratesCircleHoleBoardObjectPoints)
+{
+  Params params{};
+  params.target_type = Params::TargetType::CircleHoleBoard;
+  params.hole_rows = 2;
+  params.hole_cols = 3;
+  params.hole_spacing_x = 0.2;
+  params.hole_spacing_y = 0.1;
+
+  const auto object_points = generateCircleHoleBoardObjectPoints(params);
+  ASSERT_EQ(object_points.size(), 6u);
+  EXPECT_EQ(expectedTargetCount(params), 6);
+  EXPECT_FLOAT_EQ(object_points.front().x, -0.2f);
+  EXPECT_FLOAT_EQ(object_points.front().y, 0.05f);
+  EXPECT_FLOAT_EQ(object_points.back().x, 0.2f);
+  EXPECT_FLOAT_EQ(object_points.back().y, -0.05f);
+}
+
+TEST(TargetSorting, SortsCircleHoleGridForCameraAndLidar)
+{
+  const int rows = 2;
+  const int cols = 3;
+  const double spacing_x = 0.2;
+  const double spacing_y = 0.1;
+  const std::string forward_name = "+x";
+  const std::string up_name = "+z";
+
+  Eigen::Vector3f forward;
+  Eigen::Vector3f left;
+  Eigen::Vector3f up;
+  std::string normalized_forward;
+  std::string normalized_left;
+  std::string normalized_up;
+  std::string error;
+  ASSERT_TRUE(resolveLidarMountAxes(forward_name, up_name,
+                                    forward, left, up,
+                                    normalized_forward, normalized_left,
+                                    normalized_up, error));
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr camera_points(new pcl::PointCloud<pcl::PointXYZ>);
+  pcl::PointCloud<pcl::PointXYZ>::Ptr lidar_points(new pcl::PointCloud<pcl::PointXYZ>);
+  const std::vector<Eigen::Vector3f> ordered_body_points = {
+      {3.0f,  0.2f, -0.05f},
+      {3.0f,  0.0f, -0.05f},
+      {3.0f, -0.2f, -0.05f},
+      {3.0f,  0.2f,  0.05f},
+      {3.0f,  0.0f,  0.05f},
+      {3.0f, -0.2f,  0.05f}};
+  const std::vector<int> shuffled = {4, 1, 5, 0, 3, 2};
+
+  for (int idx : shuffled)
+  {
+    const Eigen::Vector3f& body = ordered_body_points[idx];
+    const Eigen::Vector3f native =
+        forward * body.x() + left * body.y() + up * body.z();
+    lidar_points->push_back(makePoint(native));
+    camera_points->push_back(makePoint(Eigen::Vector3f(-body.y(), -body.z(), body.x())));
+  }
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr sorted_camera(new pcl::PointCloud<pcl::PointXYZ>);
+  pcl::PointCloud<pcl::PointXYZ>::Ptr sorted_lidar(new pcl::PointCloud<pcl::PointXYZ>);
+  ASSERT_TRUE(sortGridPatternCenters(camera_points, sorted_camera,
+                                     rows, cols, spacing_x, spacing_y, "camera"));
+  ASSERT_TRUE(sortGridPatternCenters(lidar_points, sorted_lidar,
+                                     rows, cols, spacing_x, spacing_y,
+                                     "lidar", forward_name, up_name));
+
+  ASSERT_EQ(sorted_camera->size(), sorted_lidar->size());
+  for (std::size_t i = 0; i < sorted_lidar->size(); ++i)
+  {
+    const auto& p = sorted_lidar->points[i];
+    const Eigen::Vector3f optical =
+        toOptical(Eigen::Vector3f(p.x, p.y, p.z), forward, left, up);
+    EXPECT_NEAR(optical.x(), sorted_camera->points[i].x, 1e-5f);
+    EXPECT_NEAR(optical.y(), sorted_camera->points[i].y, 1e-5f);
+    EXPECT_NEAR(optical.z(), sorted_camera->points[i].z, 1e-5f);
+  }
+}
+
 TEST(OutputDirectory, CreatesMissingParents)
 {
   const std::string root =

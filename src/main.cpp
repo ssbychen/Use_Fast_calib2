@@ -16,6 +16,11 @@ int main(int argc, char **argv)
 
     // 读取参数
     Params params = loadParameters(nh);
+    if (!params.config_valid)
+    {
+      ROS_ERROR_STREAM("[Main] Invalid target configuration: " << params.config_error);
+      return 1;
+    }
     std::string mounting_error;
     if (!validateLidarMountAxes(params.lidar_forward_axis, params.lidar_up_axis,
                                 mounting_error))
@@ -75,18 +80,26 @@ int main(int argc, char **argv)
     
     // 检测 QR 码
     PointCloud<PointXYZ>::Ptr qr_center_cloud(new PointCloud<PointXYZ>);
-    qr_center_cloud->reserve(4);
-    qrDetectPtr->detect_qr(img_input, qr_center_cloud);
-    if (qr_center_cloud->size() != TARGET_NUM_CIRCLES)
+    const int expected_target_count = expectedTargetCount(params);
+    qr_center_cloud->reserve(expected_target_count);
+    if (params.target_type == Params::TargetType::CircleHoleBoard)
     {
-      ROS_ERROR_STREAM("[Main] Expected " << TARGET_NUM_CIRCLES
+      qrDetectPtr->detect_circle_hole_board(img_input, qr_center_cloud);
+    }
+    else
+    {
+      qrDetectPtr->detect_qr(img_input, qr_center_cloud);
+    }
+    if (static_cast<int>(qr_center_cloud->size()) != expected_target_count)
+    {
+      ROS_ERROR_STREAM("[Main] Expected " << expected_target_count
                        << " camera target centers, got " << qr_center_cloud->size() << ".");
       return 1;
     }
 
     // 检测 LiDAR 数据
     PointCloud<PointXYZ>::Ptr lidar_center_cloud(new PointCloud<PointXYZ>);
-    lidar_center_cloud->reserve(4);
+    lidar_center_cloud->reserve(expected_target_count);
     
     switch (dataPreprocessPtr->lidar_type_)
     {
@@ -104,9 +117,9 @@ int main(int argc, char **argv)
                     << RESET << std::endl;
             break;
     }
-    if (lidar_center_cloud->size() != TARGET_NUM_CIRCLES)
+    if (static_cast<int>(lidar_center_cloud->size()) != expected_target_count)
     {
-      ROS_ERROR_STREAM("[Main] Expected " << TARGET_NUM_CIRCLES
+      ROS_ERROR_STREAM("[Main] Expected " << expected_target_count
                        << " LiDAR target centers, got " << lidar_center_cloud->size() << ".");
       return 1;
     }
@@ -114,16 +127,43 @@ int main(int argc, char **argv)
     // 对 QR 和 LiDAR 检测到的圆心进行排序
     PointCloud<PointXYZ>::Ptr qr_centers(new PointCloud<PointXYZ>);
     PointCloud<PointXYZ>::Ptr lidar_centers(new PointCloud<PointXYZ>);
-    if (!sortPatternCenters(qr_center_cloud, qr_centers, "camera") ||
-        !sortPatternCenters(lidar_center_cloud, lidar_centers, "lidar",
-                            params.lidar_forward_axis, params.lidar_up_axis))
+    bool sort_ok = false;
+    if (params.target_type == Params::TargetType::CircleHoleBoard)
+    {
+      sort_ok = sortGridPatternCenters(qr_center_cloud, qr_centers,
+                                      params.hole_rows, params.hole_cols,
+                                      params.hole_spacing_x, params.hole_spacing_y,
+                                      "camera") &&
+                sortGridPatternCenters(lidar_center_cloud, lidar_centers,
+                                      params.hole_rows, params.hole_cols,
+                                      params.hole_spacing_x, params.hole_spacing_y,
+                                      "lidar",
+                                      params.lidar_forward_axis, params.lidar_up_axis);
+    }
+    else
+    {
+      sort_ok = sortPatternCenters(qr_center_cloud, qr_centers, "camera") &&
+                sortPatternCenters(lidar_center_cloud, lidar_centers, "lidar",
+                                  params.lidar_forward_axis, params.lidar_up_axis);
+    }
+    if (!sort_ok)
     {
       ROS_ERROR("[Main] Failed to sort target centers. Check the LiDAR mounting-axis configuration.");
       return 1;
     }
 
-    validateTargetGeometry(qr_centers, params.delta_width_circles, params.delta_height_circles, "QR");
-    validateTargetGeometry(lidar_centers, params.delta_width_circles, params.delta_height_circles, "LiDAR");
+    if (params.target_type == Params::TargetType::CircleHoleBoard)
+    {
+      validateGridTargetGeometry(qr_centers, params.hole_rows, params.hole_cols,
+                                params.hole_spacing_x, params.hole_spacing_y, "Camera");
+      validateGridTargetGeometry(lidar_centers, params.hole_rows, params.hole_cols,
+                                params.hole_spacing_x, params.hole_spacing_y, "LiDAR");
+    }
+    else
+    {
+      validateTargetGeometry(qr_centers, params.delta_width_circles, params.delta_height_circles, "QR");
+      validateTargetGeometry(lidar_centers, params.delta_width_circles, params.delta_height_circles, "LiDAR");
+    }
 
     // 保存中间结果：排序后的 LiDAR 圆心和 QR 圆心
     saveTargetHoleCenters(lidar_centers, qr_centers, params);
