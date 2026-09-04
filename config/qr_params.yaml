@@ -12,6 +12,7 @@
   p2: 0.0006409200928440982
 
 # Calibration target parameters
+  target_type: qr # qr or circle_hole_board; leave unset to keep the original QR workflow
   marker_size: 0.20 # ArUco marker side length; adjust to match your physical target
   delta_width_qr_center: 0.55 # Half the distance between the centers of two markers in the horizontal direction 
   delta_height_qr_center: 0.35 # Half the distance between the centers of two markers in the vertical direction
@@ -26,6 +27,14 @@
   auto_roi_voxel_leaf: 0.01
   annulus_voxel_leaf: 0.005
   auto_roi_geometry_max_error: 0.10
+  hole_rows: 3 # Used only when target_type == circle_hole_board
+  hole_cols: 4
+  hole_spacing_x: 0.15 # m
+  hole_spacing_y: 0.15 # m
+  hole_diameter: 0.07 # m
+  hole_radius_tolerance: 0.02 # m, relaxed a bit for MID360 edge noise
+  hole_max_fit_error: 0.02 # m
+  hole_min_edge_points: 30
 
   use_auto_lidar_roi: true
 

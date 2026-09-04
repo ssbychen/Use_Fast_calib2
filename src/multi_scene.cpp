@@ -21,8 +21,8 @@ struct RigidResult
 };
 struct Block {
   std::string time_line;
-  std::vector<Eigen::Vector3d> lidar_pts; // 4
-  std::vector<Eigen::Vector3d> qr_pts;    // 4
+  std::vector<Eigen::Vector3d> lidar_pts;
+  std::vector<Eigen::Vector3d> qr_pts;
 };
 
 RigidResult SolveRigidTransformWeighted(
@@ -143,25 +143,39 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // 解析所有 block（按三行一组：time + lidar_centers + qr_centers）
+    // 解析所有 block（兼容 time -> target_type/count -> lidar_centers -> qr_centers，
+    // 以及旧格式 time -> lidar_centers -> qr_centers）
     std::vector<Block> blocks;
-    for (size_t i = 0; i + 2 < lines.size(); ++i) 
+    for (size_t i = 0; i + 2 < lines.size(); ++i)
     {
-        if (lines[i].rfind("time:", 0) == 0 &&
-            lines[i+1].find("lidar_centers:") != std::string::npos &&
-            lines[i+2].find("qr_centers:")    != std::string::npos) 
+        if (lines[i].rfind("time:", 0) != 0)
         {
-            Block b;
-            b.time_line = lines[i];
+            continue;
+        }
 
-            if (!parseCentersLine(lines[i+1], b.lidar_pts)) continue;
-            if (!parseCentersLine(lines[i+2], b.qr_pts))    continue;
-            // 要求每组正好4个
-            if (b.lidar_pts.size() == 4 && b.qr_pts.size() == 4) 
-            {
-                blocks.push_back(std::move(b));
-                i += 2; // 跳过这个block
-            }
+        size_t lidar_line_index = i + 1;
+        size_t qr_line_index = i + 2;
+        if (lidar_line_index < lines.size() &&
+            lines[lidar_line_index].rfind("target_type:", 0) == 0)
+        {
+            ++lidar_line_index;
+            ++qr_line_index;
+        }
+        if (qr_line_index >= lines.size()) continue;
+        if (lines[lidar_line_index].find("lidar_centers:") == std::string::npos ||
+            lines[qr_line_index].find("qr_centers:") == std::string::npos)
+        {
+            continue;
+        }
+
+        Block b;
+        b.time_line = lines[i];
+        if (!parseCentersLine(lines[lidar_line_index], b.lidar_pts)) continue;
+        if (!parseCentersLine(lines[qr_line_index], b.qr_pts)) continue;
+        if (b.lidar_pts.size() >= 3 && b.lidar_pts.size() == b.qr_pts.size())
+        {
+            blocks.push_back(std::move(b));
+            i = qr_line_index;
         }
     }
     if (blocks.size() < 3) 
@@ -172,18 +186,29 @@ int main(int argc, char** argv)
 
     // 取最后3个 block
     std::vector<Eigen::Vector3d> L, C;
+    size_t expected_points_per_block = 0;
     for (size_t k = blocks.size() - 3; k < blocks.size(); ++k) 
     {
         const auto& b = blocks[k];
-        // 依次拼入，保持顺序一致
-        for (int i = 0; i < 4; ++i) 
+        if (expected_points_per_block == 0)
+        {
+            expected_points_per_block = b.lidar_pts.size();
+        }
+        if (b.lidar_pts.size() != expected_points_per_block ||
+            b.qr_pts.size() != expected_points_per_block)
+        {
+            ROS_ERROR("Point count mismatch across calibration blocks.");
+            return 1;
+        }
+        for (size_t i = 0; i < b.lidar_pts.size(); ++i)
         {
             L.push_back(b.lidar_pts[i]);
             C.push_back(b.qr_pts[i]);
         }
     }
-    if (L.size() != 12 || C.size() != 12) {
-        ROS_ERROR("Merged pairs not equal to 12 (L=%zu, C=%zu).", L.size(), C.size());
+    if (L.size() != expected_points_per_block * 3 ||
+        C.size() != expected_points_per_block * 3) {
+        ROS_ERROR("Merged pair count mismatch (L=%zu, C=%zu).", L.size(), C.size());
         return 1;
     }
 

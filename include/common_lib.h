@@ -9,6 +9,7 @@ which is included as part of this source code package.
 #define COMMON_LIB_H
 #define PCL_NO_PRECOMPILE
 
+#include <Eigen/Dense>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
@@ -29,7 +30,11 @@ which is included as part of this source code package.
 #include <cctype>
 #include <cstdint>
 #include <cmath>
+#include <chrono>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <opencv2/opencv.hpp>
 #include <sstream>
 #include <sys/stat.h>
@@ -72,8 +77,16 @@ struct Params {
   bool use_auto_lidar_roi;
   int camera_width, camera_height;
   double fx, fy, cx, cy, k1, k2, p1, p2;
+  enum class TargetType {
+    QR = 0,
+    CircleHoleBoard = 1
+  } target_type;
   double marker_size, delta_width_qr_center, delta_height_qr_center;
   double delta_width_circles, delta_height_circles, circle_radius, annulus_half_width;
+  int hole_rows, hole_cols;
+  double hole_spacing_x, hole_spacing_y, hole_diameter;
+  double hole_radius_tolerance, hole_max_fit_error;
+  int hole_min_edge_points;
   double board_width, board_height, board_roi_margin, board_roi_depth;
   double auto_roi_voxel_leaf, annulus_voxel_leaf, auto_roi_geometry_max_error;
   int min_detected_markers;
@@ -83,11 +96,78 @@ struct Params {
   string lidar_forward_axis;
   string lidar_up_axis;
   string output_path;
+  bool config_valid;
+  string config_error;
 };
+
+const char* targetTypeName(Params::TargetType target_type)
+{
+  switch (target_type) {
+    case Params::TargetType::CircleHoleBoard:
+      return "circle_hole_board";
+    case Params::TargetType::QR:
+    default:
+      return "qr";
+  }
+}
+
+bool parseTargetType(const std::string& value, Params::TargetType& target_type)
+{
+  std::string token;
+  token.reserve(value.size());
+  for (char c : value) {
+    if (!std::isspace(static_cast<unsigned char>(c))) {
+      token.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+
+  if (token.empty() || token == "qr") {
+    target_type = Params::TargetType::QR;
+    return true;
+  }
+  if (token == "circle_hole_board") {
+    target_type = Params::TargetType::CircleHoleBoard;
+    return true;
+  }
+  return false;
+}
+
+int expectedTargetCount(const Params& params)
+{
+  if (params.target_type == Params::TargetType::CircleHoleBoard) {
+    return params.hole_rows * params.hole_cols;
+  }
+  return TARGET_NUM_CIRCLES;
+}
+
+std::vector<cv::Point3f> generateCircleHoleBoardObjectPoints(const Params& params)
+{
+  std::vector<cv::Point3f> object_points;
+  if (params.hole_rows <= 0 || params.hole_cols <= 0) {
+    return object_points;
+  }
+
+  object_points.reserve(static_cast<size_t>(params.hole_rows * params.hole_cols));
+  const double half_cols = 0.5 * static_cast<double>(params.hole_cols - 1);
+  const double half_rows = 0.5 * static_cast<double>(params.hole_rows - 1);
+  for (int row = 0; row < params.hole_rows; ++row) {
+    for (int col = 0; col < params.hole_cols; ++col) {
+      const double x = (static_cast<double>(col) - half_cols) * params.hole_spacing_x;
+      const double y = (half_rows - static_cast<double>(row)) * params.hole_spacing_y;
+      object_points.emplace_back(static_cast<float>(x),
+                                 static_cast<float>(y),
+                                 0.0f);
+    }
+  }
+  return object_points;
+}
 
 // 读取参数
 Params loadParameters(ros::NodeHandle &nh) {
   Params params;
+  params.target_type = Params::TargetType::QR;
+  params.config_valid = true;
+  params.config_error.clear();
   nh.param("camera_width", params.camera_width, 0);
   nh.param("camera_height", params.camera_height, 0);
   nh.param("fx", params.fx, 1215.31801774424);
@@ -103,6 +183,22 @@ Params loadParameters(ros::NodeHandle &nh) {
   nh.param("delta_height_qr_center", params.delta_height_qr_center, 0.35);
   nh.param("delta_width_circles", params.delta_width_circles, 0.5);
   nh.param("delta_height_circles", params.delta_height_circles, 0.4);
+  std::string target_type_value;
+  nh.param("target_type", target_type_value, std::string("qr"));
+  if (!parseTargetType(target_type_value, params.target_type)) {
+    params.config_valid = false;
+    params.config_error = "unsupported target_type '" + target_type_value +
+                          "' (expected 'qr' or 'circle_hole_board')";
+    ROS_ERROR_STREAM("[Config] " << params.config_error);
+  }
+  nh.param("hole_rows", params.hole_rows, 0);
+  nh.param("hole_cols", params.hole_cols, 0);
+  nh.param("hole_spacing_x", params.hole_spacing_x, 0.0);
+  nh.param("hole_spacing_y", params.hole_spacing_y, 0.0);
+  nh.param("hole_diameter", params.hole_diameter, 0.0);
+  nh.param("hole_radius_tolerance", params.hole_radius_tolerance, 0.03);
+  nh.param("hole_max_fit_error", params.hole_max_fit_error, 0.02);
+  nh.param("hole_min_edge_points", params.hole_min_edge_points, 30);
   nh.param("min_detected_markers", params.min_detected_markers, 3);
   nh.param("circle_radius", params.circle_radius, 0.12);
   nh.param("annulus_half_width", params.annulus_half_width, 0.025);
@@ -163,6 +259,33 @@ Params loadParameters(ros::NodeHandle &nh) {
   nh.param("y_max", params.y_max, 2.0);
   nh.param("z_min", params.z_min, -0.5);
   nh.param("z_max", params.z_max, 2.0);
+
+  if (params.target_type == Params::TargetType::CircleHoleBoard) {
+    if (params.hole_rows < 2 || params.hole_cols < 2) {
+      params.config_valid = false;
+      params.config_error = "circle_hole_board requires hole_rows >= 2 and hole_cols >= 2";
+    } else if (!std::isfinite(params.hole_spacing_x) || !std::isfinite(params.hole_spacing_y) ||
+               params.hole_spacing_x <= 0.0 || params.hole_spacing_y <= 0.0) {
+      params.config_valid = false;
+      params.config_error = "circle_hole_board requires positive hole_spacing_x and hole_spacing_y";
+    } else if (!std::isfinite(params.hole_diameter) || params.hole_diameter <= 0.0) {
+      params.config_valid = false;
+      params.config_error = "circle_hole_board requires a positive hole_diameter";
+    } else if (params.hole_diameter >= params.hole_spacing_x ||
+               params.hole_diameter >= params.hole_spacing_y) {
+      params.config_valid = false;
+      params.config_error = "hole_diameter must be smaller than both hole_spacing_x and hole_spacing_y";
+    } else if (!std::isfinite(params.hole_radius_tolerance) || params.hole_radius_tolerance <= 0.0 ||
+               !std::isfinite(params.hole_max_fit_error) || params.hole_max_fit_error <= 0.0 ||
+               params.hole_min_edge_points < 8) {
+      params.config_valid = false;
+      params.config_error = "circle_hole_board thresholds are invalid; check hole_radius_tolerance, hole_max_fit_error, and hole_min_edge_points";
+    }
+
+    if (!params.config_valid) {
+      ROS_ERROR_STREAM("[Config] " << params.config_error);
+    }
+  }
   return params;
 }
 
@@ -382,8 +505,9 @@ void saveTargetHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& lidar_cent
                       const pcl::PointCloud<pcl::PointXYZ>::Ptr& qr_centers,
                       const Params& params)
 {
-    if (lidar_centers->size() != 4 || qr_centers->size() != 4) {
-      std::cerr << "[saveTargetHoleCenters] The number of points in lidar_centers or qr_centers is not 4, skip saving." << std::endl;
+    if (lidar_centers->empty() || qr_centers->empty() ||
+        lidar_centers->size() != qr_centers->size()) {
+      std::cerr << "[saveTargetHoleCenters] lidar_centers and qr_centers must be non-empty and have identical sizes, skip saving." << std::endl;
       return;
     }
     
@@ -405,6 +529,8 @@ void saveTargetHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& lidar_cent
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
     saveFile << "time: " << std::put_time(std::localtime(&now_time), "%Y-%m-%d %H:%M:%S") << std::endl;
+    saveFile << "target_type: " << targetTypeName(params.target_type)
+             << ", count: " << lidar_centers->size() << std::endl;
 
     saveFile << "lidar_centers:";
     for (const auto& pt : lidar_centers->points) {
@@ -417,7 +543,9 @@ void saveTargetHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& lidar_cent
     }
     saveFile << std::endl;
     saveFile.close();
-    std::cout << BOLDGREEN << "[Record] Saved four pairs of target centers to " << BOLDWHITE << saveDir << "circle_center_record.txt" << RESET << std::endl;
+    std::cout << BOLDGREEN << "[Record] Saved " << lidar_centers->size()
+              << " pairs of target centers to " << BOLDWHITE
+              << saveDir << "circle_center_record.txt" << RESET << std::endl;
 }
 
 // 保存单帧外参结果、彩色点云和 QR 检测图
@@ -578,6 +706,58 @@ bool validateLidarMountAxes(const std::string& forward_axis_name,
                                error);
 }
 
+bool prepareSortingFramePoints(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pc,
+                               pcl::PointCloud<pcl::PointXYZ>::Ptr work_pc,
+                               const std::string& axis_mode = "camera",
+                               const std::string& lidar_forward_axis = "+x",
+                               const std::string& lidar_up_axis = "+z")
+{
+  work_pc->clear();
+  if (axis_mode == "lidar") {
+    Eigen::Vector3f forward_axis;
+    Eigen::Vector3f left_axis;
+    Eigen::Vector3f up_axis;
+    std::string normalized_forward;
+    std::string normalized_left;
+    std::string normalized_up;
+    std::string error;
+    if (!resolveLidarMountAxes(lidar_forward_axis, lidar_up_axis,
+                               forward_axis, left_axis, up_axis,
+                               normalized_forward, normalized_left, normalized_up,
+                               error)) {
+      ROS_ERROR_STREAM("[prepareSortingFramePoints] Invalid LiDAR mounting: " << error);
+      return false;
+    }
+
+    ROS_INFO_STREAM("[prepareSortingFramePoints] LiDAR mounting resolved: forward="
+                    << normalized_forward << ", left=" << normalized_left
+                    << ", up=" << normalized_up);
+
+    work_pc->reserve(pc->size());
+    for (const auto& p : *pc) {
+      const Eigen::Vector3f lidar_point(p.x, p.y, p.z);
+      const float body_forward = lidar_point.dot(forward_axis);
+      const float body_left = lidar_point.dot(left_axis);
+      const float body_up = lidar_point.dot(up_axis);
+
+      pcl::PointXYZ pt;
+      pt.x = -body_left;
+      pt.y = -body_up;
+      pt.z = body_forward;
+      work_pc->push_back(pt);
+    }
+    return true;
+  }
+
+  if (axis_mode == "camera") {
+    *work_pc = *pc;
+    return true;
+  }
+
+  ROS_ERROR_STREAM("[prepareSortingFramePoints] Unknown axis_mode '" << axis_mode << "'.");
+  return false;
+}
+
 // 将 4 个标定板中心按固定顺序排序，支持 camera 和 lidar 坐标输入。
 // LiDAR 输入先依据用户配置转换为规范机体系，再映射为相机光学坐标
 // (X right, Y down, Z forward)进行排序。
@@ -593,44 +773,8 @@ bool sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc,
   }
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr work_pc(new pcl::PointCloud<pcl::PointXYZ>());
-
-  if (axis_mode == "lidar") {
-    Eigen::Vector3f forward_axis;
-    Eigen::Vector3f left_axis;
-    Eigen::Vector3f up_axis;
-    std::string normalized_forward;
-    std::string normalized_left;
-    std::string normalized_up;
-    std::string error;
-    if (!resolveLidarMountAxes(lidar_forward_axis, lidar_up_axis,
-                               forward_axis, left_axis, up_axis,
-                               normalized_forward, normalized_left, normalized_up,
-                               error)) {
-      ROS_ERROR_STREAM("[sortPatternCenters] Invalid LiDAR mounting: " << error);
-      v->clear();
-      return false;
-    }
-
-    ROS_INFO_STREAM("[sortPatternCenters] LiDAR mounting resolved: forward="
-                    << normalized_forward << ", left=" << normalized_left
-                    << ", up=" << normalized_up);
-
-    for (const auto& p : *pc) {
-      const Eigen::Vector3f lidar_point(p.x, p.y, p.z);
-      const float body_forward = lidar_point.dot(forward_axis);
-      const float body_left = lidar_point.dot(left_axis);
-      const float body_up = lidar_point.dot(up_axis);
-
-      pcl::PointXYZ pt;
-      pt.x = -body_left;  // body left -> optical right
-      pt.y = -body_up;    // body up   -> optical down
-      pt.z = body_forward;
-      work_pc->push_back(pt);
-    }
-  } else if (axis_mode == "camera") {
-    *work_pc = *pc;
-  } else {
-    ROS_ERROR_STREAM("[sortPatternCenters] Unknown axis_mode '" << axis_mode << "'.");
+  if (!prepareSortingFramePoints(pc, work_pc, axis_mode,
+                                 lidar_forward_axis, lidar_up_axis)) {
     v->clear();
     return false;
   }
@@ -673,6 +817,115 @@ bool sortPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc,
   v->resize(4);
   for (int i = 0; i < 4; ++i) {
     (*v)[i] = pc->points[sorted_indices[i]];
+  }
+  return true;
+}
+
+bool sortGridPatternCenters(pcl::PointCloud<pcl::PointXYZ>::Ptr pc,
+                            pcl::PointCloud<pcl::PointXYZ>::Ptr v,
+                            int rows,
+                            int cols,
+                            double spacing_x,
+                            double spacing_y,
+                            const std::string& axis_mode = "camera",
+                            const std::string& lidar_forward_axis = "+x",
+                            const std::string& lidar_up_axis = "+z")
+{
+  const int expected_count = rows * cols;
+  if (rows <= 0 || cols <= 0 || static_cast<int>(pc->size()) != expected_count) {
+    std::cerr << BOLDRED << "[sortGridPatternCenters] Need exactly "
+              << expected_count << " points, got " << pc->size() << "."
+              << RESET << std::endl;
+    return false;
+  }
+
+  pcl::PointCloud<pcl::PointXYZ>::Ptr work_pc(new pcl::PointCloud<pcl::PointXYZ>());
+  if (!prepareSortingFramePoints(pc, work_pc, axis_mode,
+                                 lidar_forward_axis, lidar_up_axis)) {
+    v->clear();
+    return false;
+  }
+
+  Eigen::Vector4f centroid4;
+  pcl::compute3DCentroid(*work_pc, centroid4);
+  const Eigen::Vector2f centroid(centroid4.x(), centroid4.y());
+
+  Eigen::Matrix2f covariance = Eigen::Matrix2f::Zero();
+  for (const auto& p : work_pc->points) {
+    const Eigen::Vector2f d(p.x - centroid.x(), p.y - centroid.y());
+    covariance += d * d.transpose();
+  }
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(covariance);
+  if (solver.info() != Eigen::Success) {
+    std::cerr << BOLDRED << "[sortGridPatternCenters] Failed to solve PCA." << RESET << std::endl;
+    return false;
+  }
+
+  Eigen::Vector2f axis_a = solver.eigenvectors().col(1).normalized();
+  Eigen::Vector2f axis_b = solver.eigenvectors().col(0).normalized();
+
+  auto axisSpan = [&](const Eigen::Vector2f& axis) {
+    float min_proj = std::numeric_limits<float>::max();
+    float max_proj = std::numeric_limits<float>::lowest();
+    for (const auto& p : work_pc->points) {
+      const Eigen::Vector2f d(p.x - centroid.x(), p.y - centroid.y());
+      const float projection = d.dot(axis);
+      min_proj = std::min(min_proj, projection);
+      max_proj = std::max(max_proj, projection);
+    }
+    return static_cast<double>(max_proj - min_proj);
+  };
+
+  const double span_a = axisSpan(axis_a);
+  const double span_b = axisSpan(axis_b);
+  const double width_extent = std::max(0, cols - 1) * spacing_x;
+  const double height_extent = std::max(0, rows - 1) * spacing_y;
+  const double score_ab = std::fabs(span_a - width_extent) + std::fabs(span_b - height_extent);
+  const double score_ba = std::fabs(span_b - width_extent) + std::fabs(span_a - height_extent);
+
+  Eigen::Vector2f col_axis = score_ab <= score_ba ? axis_a : axis_b;
+  Eigen::Vector2f row_axis = score_ab <= score_ba ? axis_b : axis_a;
+
+  if (col_axis.dot(Eigen::Vector2f::UnitX()) < 0.0f) col_axis *= -1.0f;
+  if (row_axis.dot(Eigen::Vector2f::UnitY()) < 0.0f) row_axis *= -1.0f;
+  if (col_axis.x() * row_axis.y() - col_axis.y() * row_axis.x() < 0.0f) {
+    row_axis *= -1.0f;
+  }
+
+  struct IndexedProjection {
+    float row_value = 0.0f;
+    float col_value = 0.0f;
+    int original_index = -1;
+  };
+  std::vector<IndexedProjection> projections;
+  projections.reserve(work_pc->size());
+  for (size_t i = 0; i < work_pc->size(); ++i) {
+    const auto& p = work_pc->points[i];
+    const Eigen::Vector2f d(p.x - centroid.x(), p.y - centroid.y());
+    projections.push_back({d.dot(row_axis), d.dot(col_axis), static_cast<int>(i)});
+  }
+
+  std::sort(projections.begin(), projections.end(),
+            [](const IndexedProjection& a, const IndexedProjection& b) {
+              if (std::fabs(a.row_value - b.row_value) > 1e-5f) {
+                return a.row_value < b.row_value;
+              }
+              return a.col_value < b.col_value;
+            });
+
+  v->clear();
+  v->reserve(pc->size());
+  for (int row = 0; row < rows; ++row) {
+    auto begin = projections.begin() + row * cols;
+    auto end = begin + cols;
+    std::sort(begin, end,
+              [](const IndexedProjection& a, const IndexedProjection& b) {
+                return a.col_value < b.col_value;
+              });
+    for (auto it = begin; it != end; ++it) {
+      v->push_back(pc->points[it->original_index]);
+    }
   }
   return true;
 }
@@ -737,6 +990,50 @@ void validateTargetGeometry(const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers,
 
   std::cout << std::endl;
   std::cout << "[Geometry][" << label << "] max error = "
+            << max_error * 1000.0 << " mm, RMSE = "
+            << rmse * 1000.0 << " mm" << std::endl;
+}
+
+void validateGridTargetGeometry(const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers,
+                                int rows,
+                                int cols,
+                                double spacing_x,
+                                double spacing_y,
+                                const std::string& label)
+{
+  const int expected_count = rows * cols;
+  if (rows <= 0 || cols <= 0 || static_cast<int>(centers->size()) != expected_count) {
+    std::cerr << "[Geometry][" << label << "] Need " << expected_count
+              << " centers, got " << centers->size() << std::endl;
+    return;
+  }
+
+  double max_error = 0.0;
+  double rmse = 0.0;
+  int count = 0;
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      const int idx = row * cols + col;
+      if (col + 1 < cols) {
+        const double measured = distance3D(centers->points[idx], centers->points[idx + 1]);
+        const double error = measured - spacing_x;
+        max_error = std::max(max_error, std::fabs(error));
+        rmse += error * error;
+        ++count;
+      }
+      if (row + 1 < rows) {
+        const double measured = distance3D(centers->points[idx], centers->points[idx + cols]);
+        const double error = measured - spacing_y;
+        max_error = std::max(max_error, std::fabs(error));
+        rmse += error * error;
+        ++count;
+      }
+    }
+  }
+
+  if (count == 0) return;
+  rmse = std::sqrt(rmse / static_cast<double>(count));
+  std::cout << "[Geometry][" << label << "] grid max error = "
             << max_error * 1000.0 << " mm, RMSE = "
             << rmse * 1000.0 << " mm" << std::endl;
 }

@@ -64,6 +64,44 @@ Mechanical LiDAR pipeline:
 
 The final quality checks include center-to-center geometry error and annulus radius consistency.
 
+### Circle-hole board mode
+
+The repository also supports a `circle_hole_board` mode for boards whose LiDAR-side features are circular holes instead of reflective annuli. In this mode:
+
+- the **camera side still uses the existing QR / ArUco board pose estimation** to recover the board pose;
+- the **LiDAR side reuses the existing circle fitting path** on hole-boundary points extracted from the fitted board plane;
+- the solver input remains the same point-correspondence format, so no separate backend is required.
+
+Configure it in `config/qr_params.yaml`:
+
+```yaml
+target_type: circle_hole_board
+hole_rows: 3
+hole_cols: 4
+hole_spacing_x: 0.15
+hole_spacing_y: 0.15
+hole_diameter: 0.07
+hole_radius_tolerance: 0.02
+hole_max_fit_error: 0.02
+hole_min_edge_points: 30
+```
+
+Parameter meanings:
+
+- `target_type`: `qr` (default) or `circle_hole_board`
+- `hole_rows`, `hole_cols`: number of hole centers to extract
+- `hole_spacing_x`, `hole_spacing_y`: center-to-center spacing in metres
+- `hole_diameter`: physical hole diameter in metres
+- `hole_radius_tolerance`: allowable fitted-radius error in metres
+- `hole_max_fit_error`: maximum mean absolute circle-fit residual in metres
+- `hole_min_edge_points`: minimum boundary points required per hole cluster
+
+MID360 suggestions:
+
+- start with a **manual board ROI** (`use_auto_lidar_roi: false` + pass-through bounds), because the existing auto-ROI logic is tuned for reflective annuli;
+- keep the board at roughly **2-6 m** and cover several viewing angles;
+- ensure each hole boundary has enough returns before calibration, otherwise the frame will be skipped with a log message.
+
 ## 4. Run Examples
 
 Prepare static acquisition data in the `calib_data` folder (Download the example data from [Google Drive](https://drive.google.com/drive/folders/1VnMCsGj3Gat7dxe6IION0SfS7jYNMw1g?usp=sharing)):
@@ -79,6 +117,18 @@ lidar_up_axis: "+z"
 ```
 
 The axis values must be signed, perpendicular axes such as `+x` and `-y`.
+
+Minimal circle-hole example:
+
+```yaml
+target_type: circle_hole_board
+use_auto_lidar_roi: false
+hole_rows: 3
+hole_cols: 4
+hole_spacing_x: 0.15
+hole_spacing_y: 0.15
+hole_diameter: 0.07
+```
 
 Run single-scene calibration:
 

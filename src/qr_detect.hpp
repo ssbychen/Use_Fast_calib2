@@ -18,6 +18,7 @@ which is included as part of this source code package.
 class QRDetect 
 {
   private:
+    Params params_;
     double marker_size_, delta_width_qr_center_, delta_height_qr_center_;
     double delta_width_circles_, delta_height_circles_;
     int min_detected_markers_;
@@ -29,7 +30,8 @@ class QRDetect
     cv::Mat cameraMatrix_;
     cv::Mat distCoeffs_;
 
-    QRDetect(ros::NodeHandle &nh, Params& params) 
+    QRDetect(ros::NodeHandle &nh, Params& params)
+      : params_(params)
     {
       marker_size_ = params.marker_size;
       delta_width_qr_center_ = params.delta_width_qr_center;
@@ -95,8 +97,11 @@ class QRDetect
       assert(groups.size() == n_permutations);
     }
 
-    void detect_qr(cv::Mat &image, pcl::PointCloud<pcl::PointXYZ>::Ptr centers_cloud) 
-    {      
+    bool detectBoardPoseAndTransformPoints(cv::Mat &image,
+                                           const std::vector<cv::Point3f>& boardTargetPoints,
+                                           pcl::PointCloud<pcl::PointXYZ>::Ptr candidates_cloud,
+                                           const std::string& target_label)
+    {
       image.copyTo(imageCopy_);
 
       // Create vector of markers corners. 4 markers * 4 corners
@@ -114,11 +119,8 @@ class QRDetect
       // Marker 3 -> aRuCo ID: 3
 
       std::vector<std::vector<cv::Point3f>> boardCorners;
-      std::vector<cv::Point3f> boardCircleCenters;
       float width = delta_width_qr_center_;
       float height = delta_height_qr_center_;
-      float circle_width = delta_width_circles_ / 2.;
-      float circle_height = delta_height_circles_ / 2.;
       boardCorners.resize(4);
       for (int i = 0; i < 4; ++i) {
         int x_qr_center =
@@ -130,9 +132,6 @@ class QRDetect
         float x_center = x_qr_center * width;
         float y_center = y_qr_center * height;
 
-        cv::Point3f circleCenter3d(x_qr_center * circle_width,
-                                  y_qr_center * circle_height, 0);
-        boardCircleCenters.push_back(circleCenter3d);
         for (int j = 0; j < 4; ++j) {
           int x_qr = (j % 3) == 0 ? -1 : 1;  // x distances are added for QRs 0 and
                                             // 3, substracted otherwise
@@ -212,9 +211,6 @@ class QRDetect
 
         // cout << "single: " <<  tvec[0] << ", "<< tvec[1] << ", " << tvec[2] << std::endl;
 
-        // pcl::PointCloud<pcl::PointXYZ>::Ptr centers_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::PointCloud<pcl::PointXYZ>::Ptr candidates_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-
     // Estimate 3D position of the board using detected markers
     #if (CV_MAJOR_VERSION == 3 && CV_MINOR_VERSION <= 2) || CV_MAJOR_VERSION < 3
         int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix_,
@@ -223,9 +219,12 @@ class QRDetect
         int valid = cv::aruco::estimatePoseBoard(corners, ids, board, cameraMatrix_,
                                                 distCoeffs_, rvec, tvec, true);
     #endif
-
-
         // cout << "board: " <<  tvec[0] << ", "<< tvec[1] << ", " << tvec[2] << std::endl;
+        if (valid <= 0)
+        {
+          ROS_WARN_STREAM("[Mono] Unable to estimate board pose for " << target_label << ".");
+          return false;
+        }
 
         cv::aruco::drawAxis(imageCopy_, cameraMatrix_, distCoeffs_, rvec, tvec, 0.2);
 
@@ -243,11 +242,13 @@ class QRDetect
         t.copyTo(board_transform.rowRange(0, 3).col(3));
 
         // Compute coordintates of circle centers
-        for (int i = 0; i < boardCircleCenters.size(); ++i) {
+        candidates_cloud->clear();
+        candidates_cloud->reserve(boardTargetPoints.size());
+        for (int i = 0; i < boardTargetPoints.size(); ++i) {
           cv::Mat mat = cv::Mat::zeros(4, 1, CV_32F);
-          mat.at<float>(0, 0) = boardCircleCenters[i].x;
-          mat.at<float>(1, 0) = boardCircleCenters[i].y;
-          mat.at<float>(2, 0) = boardCircleCenters[i].z;
+          mat.at<float>(0, 0) = boardTargetPoints[i].x;
+          mat.at<float>(1, 0) = boardTargetPoints[i].y;
+          mat.at<float>(2, 0) = boardTargetPoints[i].z;
           mat.at<float>(3, 0) = 1.0;
 
           // Transform center to target coords
@@ -269,96 +270,122 @@ class QRDetect
           qr_center.z = center3d.z;
           candidates_cloud->push_back(qr_center);
         }
-
-        /**
-          NOTE: This is included here in the same way as the rest of the modalities
-        to avoid obvious misdetections, which sometimes happened in our experiments.
-        In this modality, it should be impossible to have more than a set of
-        candidates, but we keep the ability of handling different combinations for
-        eventual future extensions.
-
-          Geometric consistency check
-          At this point, circles' center candidates have been computed
-        (found_centers). Now we need to select the set of 4 candidates that best fit
-        the calibration target geometry. To that end, the following steps are
-        followed: 1) Create a cloud with 4 points representing the exact geometry of
-        the calibration target 2) For each possible set of 4 points: compute
-        similarity score 3) Rotate back the candidates with the highest score to
-        their original position in the cloud, and add them to cumulative cloud
-        **/
-        std::vector<std::vector<int>> groups;
-        comb(candidates_cloud->size(), TARGET_NUM_CIRCLES, groups);
-        double groups_scores[groups.size()];  // -1: invalid; 0-1 normalized score
-        // groups.size() 1
-
-        for (int i = 0; i < groups.size(); ++i) 
-        {
-          std::vector<pcl::PointXYZ> candidates;
-          // Build candidates set
-          for (int j = 0; j < groups[i].size(); ++j) {
-            pcl::PointXYZ center;
-            center.x = candidates_cloud->at(groups[i][j]).x;
-            center.y = candidates_cloud->at(groups[i][j]).y;
-            center.z = candidates_cloud->at(groups[i][j]).z;
-            candidates.push_back(center);
-          }
-
-          // Compute candidates score
-          Square square_candidate(candidates, delta_width_circles_,
-                                  delta_height_circles_);
-          groups_scores[i] = square_candidate.is_valid()
-                                ? 1.0
-                                : -1;  // -1 when it's not valid, 1 otherwise
-        }
-
-        int best_candidate_idx = -1;
-        double best_candidate_score = -1;
-        for (int i = 0; i < groups.size(); ++i) 
-        {
-          if (best_candidate_score == 1 && groups_scores[i] == 1) {
-            // Exit 4: Several candidates fit target's geometry
-            ROS_ERROR(
-                "[Mono] More than one set of candidates fit target's geometry. "
-                "Please, make sure your parameters are well set. Exiting callback");
-            return;
-          }
-          if (groups_scores[i] > best_candidate_score) {
-            best_candidate_score = groups_scores[i];
-            best_candidate_idx = i;
-          }
-        }
-
-        if (best_candidate_idx == -1) 
-        {
-          // Exit: No candidates fit target's geometry
-          ROS_WARN(
-              "[Mono] Unable to find a candidate set that matches target's "
-              "geometry");
-          return;
-        }
-
-        for (int j = 0; j < groups[best_candidate_idx].size(); ++j) 
-        {
-          centers_cloud->push_back(candidates_cloud->at(groups[best_candidate_idx][j]));
-        }
-
-        if (DEBUG) 
-        {  // Draw centers
-          for (int i = 0; i < centers_cloud->size(); i++) {
-            cv::Point3f pt_circle1(centers_cloud->at(i).x, centers_cloud->at(i).y,centers_cloud->at(i).z);
-            cv::Point2f uv_circle1;
-            uv_circle1 = projectPointDist(pt_circle1, cameraMatrix_, distCoeffs_);
-            circle(imageCopy_, uv_circle1, 2, Scalar(255, 0, 255), -1);
-          }
-        }
-
-        // Publish pointcloud messages
-      } 
-      else 
+        return true;
+      }
+      else
       {
         // Markers found != TARGET_NUM_CIRCLES
-        ROS_WARN("%lu marker(s) found, %d expected. Skipping frame...", ids.size(),
-                TARGET_NUM_CIRCLES);
+        ROS_WARN_STREAM("[Mono] " << ids.size()
+                        << " marker(s) found, at least " << min_detected_markers_
+                        << " expected for " << target_label << ". Skipping frame...");
+      }
+      return false;
+    }
+
+    void detect_qr(cv::Mat &image, pcl::PointCloud<pcl::PointXYZ>::Ptr centers_cloud)
+    {
+      centers_cloud->clear();
+      const float circle_width = delta_width_circles_ / 2.f;
+      const float circle_height = delta_height_circles_ / 2.f;
+      std::vector<cv::Point3f> boardCircleCenters = {
+        cv::Point3f(-circle_width,  circle_height, 0.0f),
+        cv::Point3f( circle_width,  circle_height, 0.0f),
+        cv::Point3f( circle_width, -circle_height, 0.0f),
+        cv::Point3f(-circle_width, -circle_height, 0.0f)
+      };
+
+      pcl::PointCloud<pcl::PointXYZ>::Ptr candidates_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+      if (!detectBoardPoseAndTransformPoints(image, boardCircleCenters,
+                                             candidates_cloud, "QR target")) {
+        return;
+      }
+
+      std::vector<std::vector<int>> groups;
+      comb(candidates_cloud->size(), TARGET_NUM_CIRCLES, groups);
+      double groups_scores[groups.size()];
+
+      for (int i = 0; i < groups.size(); ++i)
+      {
+        std::vector<pcl::PointXYZ> candidates;
+        for (int j = 0; j < groups[i].size(); ++j) {
+          pcl::PointXYZ center;
+          center.x = candidates_cloud->at(groups[i][j]).x;
+          center.y = candidates_cloud->at(groups[i][j]).y;
+          center.z = candidates_cloud->at(groups[i][j]).z;
+          candidates.push_back(center);
+        }
+
+        Square square_candidate(candidates, delta_width_circles_,
+                                delta_height_circles_);
+        groups_scores[i] = square_candidate.is_valid() ? 1.0 : -1.0;
+      }
+
+      int best_candidate_idx = -1;
+      double best_candidate_score = -1;
+      for (int i = 0; i < groups.size(); ++i)
+      {
+        if (best_candidate_score == 1 && groups_scores[i] == 1) {
+          ROS_ERROR(
+              "[Mono] More than one set of candidates fit target's geometry. "
+              "Please, make sure your parameters are well set. Exiting callback");
+          return;
+        }
+        if (groups_scores[i] > best_candidate_score) {
+          best_candidate_score = groups_scores[i];
+          best_candidate_idx = i;
+        }
+      }
+
+      if (best_candidate_idx == -1)
+      {
+        ROS_WARN(
+            "[Mono] Unable to find a candidate set that matches target's "
+            "geometry");
+        return;
+      }
+
+      for (int j = 0; j < groups[best_candidate_idx].size(); ++j)
+      {
+        centers_cloud->push_back(candidates_cloud->at(groups[best_candidate_idx][j]));
+      }
+
+      if (DEBUG)
+      {
+        for (int i = 0; i < centers_cloud->size(); i++) {
+          cv::Point3f pt_circle1(centers_cloud->at(i).x, centers_cloud->at(i).y,centers_cloud->at(i).z);
+          cv::Point2f uv_circle1;
+          uv_circle1 = projectPointDist(pt_circle1, cameraMatrix_, distCoeffs_);
+          circle(imageCopy_, uv_circle1, 2, Scalar(255, 0, 255), -1);
+        }
+      }
+    }
+
+    void detect_circle_hole_board(cv::Mat &image,
+                                  pcl::PointCloud<pcl::PointXYZ>::Ptr centers_cloud)
+    {
+      centers_cloud->clear();
+      const std::vector<cv::Point3f> boardHoleCenters =
+          generateCircleHoleBoardObjectPoints(params_);
+      if (boardHoleCenters.empty()) {
+        ROS_ERROR("[Mono] circle_hole_board object layout is empty. Check hole_rows/hole_cols.");
+        return;
+      }
+
+      pcl::PointCloud<pcl::PointXYZ>::Ptr candidates_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+      if (!detectBoardPoseAndTransformPoints(image, boardHoleCenters,
+                                             candidates_cloud, "circle-hole board")) {
+        return;
+      }
+
+      *centers_cloud = *candidates_cloud;
+      if (DEBUG)
+      {
+        for (int i = 0; i < centers_cloud->size(); i++) {
+          cv::Point3f hole_center(centers_cloud->at(i).x, centers_cloud->at(i).y,
+                                  centers_cloud->at(i).z);
+          cv::Point2f uv = projectPointDist(hole_center, cameraMatrix_, distCoeffs_);
+          circle(imageCopy_, uv, 2, Scalar(255, 255, 0), -1);
+        }
       }
     }
 };

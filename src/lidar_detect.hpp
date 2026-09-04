@@ -18,7 +18,9 @@ which is included as part of this source code package.
 #include <pcl/features/normal_3d.h>
 #include "common_lib.h"
 #include <array>
+#include <functional>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,8 +28,13 @@ which is included as part of this source code package.
 class LidarDetect
 {
 private:
+    Params::TargetType target_type_;
     double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
     double circle_radius_, annulus_half_width_, delta_width_circles_, delta_height_circles_;
+    int hole_rows_, hole_cols_;
+    double hole_spacing_x_, hole_spacing_y_, hole_diameter_;
+    double hole_radius_tolerance_, hole_max_fit_error_;
+    int hole_min_edge_points_;
     double board_width_, board_height_, board_roi_margin_, board_roi_depth_;
     double auto_roi_voxel_leaf_, annulus_voxel_leaf_, auto_roi_geometry_max_error_;
     bool use_auto_lidar_roi_;
@@ -362,6 +369,62 @@ private:
         high_quantile = percentile(intensities, 0.92);
         relative_high = otsu_threshold + 0.55f * (max_i - otsu_threshold);
         threshold = std::max(std::max(otsu_threshold, foreground_low), relative_high);
+        return true;
+    }
+
+    bool extractAlignedCircleHoleBoundaryCloud(const PlaneAlignment& alignment)
+    {
+        edge_cloud_->clear();
+        if (!aligned_cloud_ || aligned_cloud_->size() < static_cast<size_t>(hole_min_edge_points_))
+        {
+            ROS_WARN("[LiDAR] Too few aligned board-plane points for circle-hole boundary extraction.");
+            return false;
+        }
+
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(aligned_cloud_);
+
+        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+        pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> normal_estimator;
+        normal_estimator.setInputCloud(aligned_cloud_);
+        normal_estimator.setSearchMethod(tree);
+        normal_estimator.setRadiusSearch(std::max(0.02, hole_diameter_ * 0.8));
+        normal_estimator.compute(*normals);
+        if (normals->size() != aligned_cloud_->size())
+        {
+            ROS_WARN("[LiDAR] Circle-hole boundary extraction failed: normal estimation size mismatch.");
+            return false;
+        }
+
+        pcl::PointCloud<pcl::Boundary> boundaries;
+        pcl::BoundaryEstimation<pcl::PointXYZ, pcl::Normal, pcl::Boundary> boundary_estimator;
+        boundary_estimator.setInputCloud(aligned_cloud_);
+        boundary_estimator.setInputNormals(normals);
+        boundary_estimator.setSearchMethod(tree);
+        boundary_estimator.setRadiusSearch(std::max(0.02, hole_diameter_ * 0.8));
+        boundary_estimator.setAngleThreshold(M_PI / 4.0);
+        boundary_estimator.compute(boundaries);
+
+        edge_cloud_->reserve(aligned_cloud_->size());
+        for (size_t i = 0; i < aligned_cloud_->size() && i < boundaries.size(); ++i)
+        {
+            if (boundaries.points[i].boundary_point > 0)
+            {
+                edge_cloud_->push_back(aligned_cloud_->points[i]);
+            }
+        }
+
+        ROS_INFO("[LiDAR] Extracted %zu aligned circle-hole boundary points.", edge_cloud_->size());
+        if (edge_cloud_->size() < static_cast<size_t>(hole_min_edge_points_))
+        {
+            ROS_WARN("[LiDAR] Too few circle-hole boundary points after boundary extraction.");
+            return false;
+        }
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr boundary_cloud_downsampled(new pcl::PointCloud<pcl::PointXYZ>);
+        voxelDownsampleClosestToCentroid(edge_cloud_, annulus_voxel_leaf_, boundary_cloud_downsampled);
+        edge_cloud_.swap(boundary_cloud_downsampled);
+        transformAlignedPointsBackToLidar(edge_cloud_, alignment, boundary_original_cloud_);
         return true;
     }
 
@@ -1656,6 +1719,12 @@ private:
     bool extractBoardRoi(const pcl::PointCloud<Common::Point>::Ptr& cloud,
                          pcl::PointCloud<Common::Point>::Ptr board_roi_cloud) const
     {
+        if (use_auto_lidar_roi_ && target_type_ == Params::TargetType::CircleHoleBoard)
+        {
+            ROS_WARN("[LiDAR] circle_hole_board currently reuses the manual board ROI path; auto ROI is tuned for reflective annuli.");
+            manualPassThroughFilter(cloud, board_roi_cloud);
+            return true;
+        }
         if (use_auto_lidar_roi_)
         {
             ROS_INFO("[LiDAR] Using automatic board ROI extraction.");
@@ -1909,6 +1978,23 @@ private:
         ROS_INFO("[LiDAR] Mechanical annulus boundary clusters: %zu", cluster_indices.size());
     }
 
+    void clusterCircleHoleBoundaryCloud(std::vector<pcl::PointIndices>& cluster_indices) const
+    {
+        cluster_indices.clear();
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(edge_cloud_);
+
+        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+        ec.setClusterTolerance(std::max(0.015, hole_diameter_ * 0.35));
+        ec.setMinClusterSize(std::max(8, hole_min_edge_points_));
+        ec.setMaxClusterSize(50000);
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(edge_cloud_);
+        ec.extract(cluster_indices);
+
+        ROS_INFO("[LiDAR] Circle-hole boundary clusters: %zu", cluster_indices.size());
+    }
+
     // 对每个 annulus 聚类拟合圆，并输出通过半径和残差检查的候选中心
     void fitAnnulusCentersFromClusters(const std::vector<pcl::PointIndices>& cluster_indices,
                                        pcl::PointCloud<pcl::PointXYZ>::Ptr candidate_centers) const
@@ -1948,6 +2034,243 @@ private:
             center_point.z = 0.0f;
             candidate_centers->push_back(center_point);
         }
+    }
+
+    void fitCircleHoleCentersFromClusters(const std::vector<pcl::PointIndices>& cluster_indices,
+                                          pcl::PointCloud<pcl::PointXYZ>::Ptr candidate_centers) const
+    {
+        candidate_centers->clear();
+        candidate_centers->reserve(cluster_indices.size());
+        const double expected_radius = 0.5 * hole_diameter_;
+
+        for (size_t i = 0; i < cluster_indices.size(); ++i)
+        {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
+            cluster->reserve(cluster_indices[i].indices.size());
+            for (const auto& idx : cluster_indices[i].indices)
+            {
+                cluster->push_back(edge_cloud_->points[idx]);
+            }
+
+            if (cluster->size() < static_cast<size_t>(hole_min_edge_points_))
+            {
+                ROS_WARN("[LiDAR] Skip sparse circle-hole cluster %zu with %zu points.", i, cluster->size());
+                continue;
+            }
+
+            CircleFitResult fit;
+            if (!fitCircleRobust(cluster, fit))
+            {
+                ROS_WARN("[LiDAR] Circle-hole fit failed for cluster %zu with %zu points.", i, cluster->size());
+                continue;
+            }
+
+            const bool radius_ok = std::fabs(fit.radius - expected_radius) <= hole_radius_tolerance_;
+            const bool error_ok = fit.mean_abs_error <= hole_max_fit_error_;
+            ROS_INFO("[LiDAR] Circle-hole cluster %zu: points=%zu, center=(%.4f, %.4f), radius=%.4f, mean abs error=%.4f",
+                     i, cluster->size(), fit.x, fit.y, fit.radius, fit.mean_abs_error);
+
+            if (!radius_ok || !error_ok)
+            {
+                ROS_WARN("[LiDAR] Reject circle-hole cluster %zu: radius_ok=%d, error_ok=%d.",
+                         i, radius_ok, error_ok);
+                continue;
+            }
+
+            pcl::PointXYZ center_point;
+            center_point.x = static_cast<float>(fit.x);
+            center_point.y = static_cast<float>(fit.y);
+            center_point.z = 0.0f;
+
+            bool duplicate = false;
+            for (const auto& existing : candidate_centers->points)
+            {
+                if (distance3D(existing, center_point) < hole_diameter_ * 0.35)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate)
+            {
+                candidate_centers->push_back(center_point);
+            }
+        }
+    }
+
+    bool evaluateCircleHoleGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& centers,
+                                double& score,
+                                double& max_error) const
+    {
+        if (!centers) return false;
+        const int expected_count = hole_rows_ * hole_cols_;
+        if (hole_rows_ <= 0 || hole_cols_ <= 0 || static_cast<int>(centers->size()) != expected_count)
+        {
+            return false;
+        }
+
+        score = 0.0;
+        max_error = 0.0;
+        for (int row = 0; row < hole_rows_; ++row)
+        {
+            for (int col = 0; col < hole_cols_; ++col)
+            {
+                const int idx = row * hole_cols_ + col;
+                if (col + 1 < hole_cols_)
+                {
+                    const double measured = distance3D(centers->points[idx], centers->points[idx + 1]);
+                    const double error = measured - hole_spacing_x_;
+                    score += error * error;
+                    max_error = std::max(max_error, std::fabs(error));
+                }
+                if (row + 1 < hole_rows_)
+                {
+                    const double measured = distance3D(centers->points[idx], centers->points[idx + hole_cols_]);
+                    const double error = measured - hole_spacing_y_;
+                    score += error * error;
+                    max_error = std::max(max_error, std::fabs(error));
+                }
+            }
+        }
+        return true;
+    }
+
+    bool selectCircleHoleCenters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& candidate_centers,
+                                 std::vector<int>& selected_indices) const
+    {
+        selected_indices.clear();
+        const int expected_count = hole_rows_ * hole_cols_;
+        if (!candidate_centers || static_cast<int>(candidate_centers->size()) < expected_count)
+        {
+            return false;
+        }
+
+        const double max_geometry_error_threshold =
+            std::max({hole_spacing_x_, hole_spacing_y_, hole_diameter_}) * 0.35;
+        double best_score = std::numeric_limits<double>::max();
+        std::vector<int> current_indices;
+        std::vector<int> best_indices;
+
+        std::function<void(int)> dfs = [&](int start_index)
+        {
+            if (current_indices.size() == static_cast<size_t>(expected_count))
+            {
+                pcl::PointCloud<pcl::PointXYZ>::Ptr subset(new pcl::PointCloud<pcl::PointXYZ>);
+                subset->reserve(current_indices.size());
+                for (int idx : current_indices)
+                {
+                    subset->push_back(candidate_centers->points[idx]);
+                }
+
+                pcl::PointCloud<pcl::PointXYZ>::Ptr sorted_subset(new pcl::PointCloud<pcl::PointXYZ>);
+                if (!sortGridPatternCenters(subset, sorted_subset,
+                                            hole_rows_, hole_cols_,
+                                            hole_spacing_x_, hole_spacing_y_))
+                {
+                    return;
+                }
+
+                double score = 0.0;
+                double max_error = 0.0;
+                if (!evaluateCircleHoleGrid(sorted_subset, score, max_error)) return;
+                if (max_error <= max_geometry_error_threshold && score < best_score)
+                {
+                    best_score = score;
+                    best_indices = current_indices;
+                }
+                return;
+            }
+
+            const int remaining_needed = expected_count - static_cast<int>(current_indices.size());
+            for (int i = start_index;
+                 i <= static_cast<int>(candidate_centers->size()) - remaining_needed;
+                 ++i)
+            {
+                current_indices.push_back(i);
+                dfs(i + 1);
+                current_indices.pop_back();
+            }
+        };
+
+        if (candidate_centers->size() == static_cast<size_t>(expected_count))
+        {
+            best_indices.resize(candidate_centers->size());
+            std::iota(best_indices.begin(), best_indices.end(), 0);
+            pcl::PointCloud<pcl::PointXYZ>::Ptr sorted_subset(new pcl::PointCloud<pcl::PointXYZ>);
+            if (!sortGridPatternCenters(candidate_centers, sorted_subset,
+                                        hole_rows_, hole_cols_,
+                                        hole_spacing_x_, hole_spacing_y_))
+            {
+                best_indices.clear();
+            }
+            else
+            {
+                double score = 0.0;
+                double max_error = 0.0;
+                if (!evaluateCircleHoleGrid(sorted_subset, score, max_error) ||
+                    max_error > max_geometry_error_threshold)
+                {
+                    best_indices.clear();
+                }
+            }
+        }
+        else if (candidate_centers->size() <= static_cast<size_t>(expected_count + 6))
+        {
+            dfs(0);
+        }
+        else
+        {
+            ROS_WARN("[LiDAR] Too many circle-hole candidates (%zu) for exhaustive correspondence search.",
+                     candidate_centers->size());
+            return false;
+        }
+
+        if (best_indices.size() != static_cast<size_t>(expected_count))
+        {
+            return false;
+        }
+
+        selected_indices = best_indices;
+        return true;
+    }
+
+    void detect_circle_hole_board(pcl::PointCloud<Common::Point>::Ptr cloud,
+                                  pcl::PointCloud<pcl::PointXYZ>::Ptr center_cloud)
+    {
+        clearDetectionClouds(center_cloud);
+
+        pcl::ModelCoefficients::Ptr plane_coefficients(new pcl::ModelCoefficients);
+        PlaneAlignment alignment;
+        if (!prepareAlignedBoard(cloud, plane_coefficients, alignment))
+        {
+            return;
+        }
+
+        if (!extractAlignedCircleHoleBoundaryCloud(alignment))
+        {
+            return;
+        }
+
+        std::vector<pcl::PointIndices> cluster_indices;
+        clusterCircleHoleBoundaryCloud(cluster_indices);
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr candidate_centers(new pcl::PointCloud<pcl::PointXYZ>);
+        fitCircleHoleCentersFromClusters(cluster_indices, candidate_centers);
+        if (candidate_centers->empty())
+        {
+            ROS_WARN("[LiDAR] No valid circle-hole center candidates found.");
+            return;
+        }
+
+        std::vector<int> selected_indices;
+        if (!selectCircleHoleCenters(candidate_centers, selected_indices))
+        {
+            ROS_WARN("[LiDAR] Circle-hole board requires %d valid centers, got %zu candidates after filtering.",
+                     hole_rows_ * hole_cols_, candidate_centers->size());
+            return;
+        }
+
+        transformCentersBackToLidar(candidate_centers, selected_indices, alignment, center_cloud);
     }
 
     // 对每个边界聚类拟合固定半径同心 annulus，输出候选圆心
@@ -2196,6 +2519,7 @@ public:
           edge_cloud_(new pcl::PointCloud<pcl::PointXYZ>),
           center_z0_cloud_(new pcl::PointCloud<pcl::PointXYZ>)
     {
+        target_type_ = params.target_type;
         x_min_ = params.x_min;
         x_max_ = params.x_max;
         y_min_ = params.y_min;
@@ -2206,6 +2530,14 @@ public:
         annulus_half_width_ = params.annulus_half_width;
         delta_width_circles_ = params.delta_width_circles;
         delta_height_circles_ = params.delta_height_circles;
+        hole_rows_ = params.hole_rows;
+        hole_cols_ = params.hole_cols;
+        hole_spacing_x_ = params.hole_spacing_x;
+        hole_spacing_y_ = params.hole_spacing_y;
+        hole_diameter_ = params.hole_diameter;
+        hole_radius_tolerance_ = params.hole_radius_tolerance;
+        hole_max_fit_error_ = params.hole_max_fit_error;
+        hole_min_edge_points_ = params.hole_min_edge_points;
         board_width_ = params.board_width;
         board_height_ = params.board_height;
         board_roi_margin_ = params.board_roi_margin;
@@ -2236,6 +2568,12 @@ public:
     // 处理机械式 LiDAR 点云并提取 4 个 annulus 中心
     void detect_mech_lidar(pcl::PointCloud<Common::Point>::Ptr cloud, pcl::PointCloud<pcl::PointXYZ>::Ptr center_cloud)
     {
+        if (target_type_ == Params::TargetType::CircleHoleBoard)
+        {
+            detect_circle_hole_board(cloud, center_cloud);
+            return;
+        }
+
         // 1. 清空上一次检测状态。
         clearDetectionClouds(center_cloud);
 
@@ -2367,6 +2705,12 @@ public:
     // 处理固态 LiDAR 点云并提取 4 个 annulus 中心
     void detect_solid_lidar(pcl::PointCloud<Common::Point>::Ptr cloud, pcl::PointCloud<pcl::PointXYZ>::Ptr center_cloud)
     {
+        if (target_type_ == Params::TargetType::CircleHoleBoard)
+        {
+            detect_circle_hole_board(cloud, center_cloud);
+            return;
+        }
+
         // 1. 清空上一次检测状态。
         clearDetectionClouds(center_cloud);
 
