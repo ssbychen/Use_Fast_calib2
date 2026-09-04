@@ -7,17 +7,19 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_ros
   pcl_conversions
   geometry_msgs
+  rosbag
 )
 
 find_package(PCL 1.10 REQUIRED)
 find_package(OpenCV REQUIRED)
 
 catkin_package(
-  CATKIN_DEPENDS roscpp sensor_msgs pcl_conversions pcl_ros
+  CATKIN_DEPENDS roscpp sensor_msgs pcl_conversions pcl_ros rosbag
 )
 
 include_directories(
   include
+  src
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
@@ -38,10 +40,6 @@ target_link_libraries(fast_calib
 )
 
 add_executable(lidar_center_test test/lidar_center_test.cpp)
-target_include_directories(lidar_center_test PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
 target_link_libraries(lidar_center_test
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
@@ -50,6 +48,13 @@ target_link_libraries(lidar_center_test
 
 add_executable(multi_fast_calib src/multi_scene.cpp)
 target_link_libraries(multi_fast_calib
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  ${OpenCV_LIBRARIES}
+)
+
+add_executable(circle_center_extract src/fit_circle_centers.cpp)
+target_link_libraries(circle_center_extract
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
