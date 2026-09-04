@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common_lib.h"
+#include "circle_center_extract_lib.hpp"
 
 namespace
 {
@@ -202,6 +203,78 @@ TEST(TargetSorting, SortsCircleHoleGridForCameraAndLidar)
     EXPECT_NEAR(optical.y(), sorted_camera->points[i].y, 1e-5f);
     EXPECT_NEAR(optical.z(), sorted_camera->points[i].z, 1e-5f);
   }
+}
+
+TEST(TargetSorting, SortsStandaloneExtractionGridWithoutSpacingHints)
+{
+  const int rows = 3;
+  const int cols = 4;
+  const double angle = -0.25;
+  const double cos_a = std::cos(angle);
+  const double sin_a = std::sin(angle);
+  const Eigen::Vector2d translation(1.2, -0.4);
+
+  std::vector<Eigen::Vector2d> ordered_points;
+  std::vector<std::pair<int, int>> ordered_labels;
+  ordered_points.reserve(rows * cols);
+  ordered_labels.reserve(rows * cols);
+  for (int row = 0; row < rows; ++row)
+  {
+    for (int col = 0; col < cols; ++col)
+    {
+      const Eigen::Vector2d base(0.18 * static_cast<double>(col),
+                                 0.11 * static_cast<double>(row));
+      const Eigen::Vector2d rotated(cos_a * base.x() - sin_a * base.y(),
+                                    sin_a * base.x() + cos_a * base.y());
+      ordered_points.push_back(rotated + translation);
+      ordered_labels.emplace_back(row, col);
+    }
+  }
+
+  const std::vector<int> shuffled = {7, 2, 10, 0, 5, 9, 1, 11, 3, 8, 4, 6};
+  std::vector<Eigen::Vector2d> shuffled_points;
+  std::vector<std::pair<int, int>> shuffled_labels;
+  shuffled_points.reserve(shuffled.size());
+  shuffled_labels.reserve(shuffled.size());
+  for (int index : shuffled)
+  {
+    shuffled_points.push_back(ordered_points[static_cast<size_t>(index)]);
+    shuffled_labels.push_back(ordered_labels[static_cast<size_t>(index)]);
+  }
+
+  std::vector<int> ordered_indices;
+  std::string error;
+  ASSERT_TRUE(circle_center_extract::sortGridIndices(shuffled_points,
+                                                     rows,
+                                                     cols,
+                                                     ordered_indices,
+                                                     &error))
+      << error;
+
+  ASSERT_EQ(ordered_indices.size(), ordered_points.size());
+  std::vector<int> row_sequence;
+  std::vector<int> col_sequence;
+  row_sequence.reserve(rows);
+  col_sequence.reserve(cols);
+  for (int row = 0; row < rows; ++row)
+  {
+    row_sequence.push_back(
+        shuffled_labels[static_cast<size_t>(ordered_indices[static_cast<size_t>(row * cols)])].first);
+    for (int col = 0; col < cols; ++col)
+    {
+      const auto& label =
+          shuffled_labels[static_cast<size_t>(ordered_indices[static_cast<size_t>(row * cols + col)])];
+      EXPECT_EQ(label.first, row_sequence.back());
+      if (row == 0) col_sequence.push_back(label.second);
+      else EXPECT_EQ(label.second, col_sequence[static_cast<size_t>(col)]);
+    }
+  }
+
+  EXPECT_EQ(std::abs(row_sequence[1] - row_sequence[0]), 1);
+  EXPECT_EQ(std::abs(row_sequence[2] - row_sequence[1]), 1);
+  EXPECT_EQ(std::abs(col_sequence[1] - col_sequence[0]), 1);
+  EXPECT_EQ(std::abs(col_sequence[2] - col_sequence[1]), 1);
+  EXPECT_EQ(std::abs(col_sequence[3] - col_sequence[2]), 1);
 }
 
 TEST(OutputDirectory, CreatesMissingParents)
