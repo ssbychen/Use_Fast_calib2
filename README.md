@@ -102,6 +102,28 @@ MID360 suggestions:
 - keep the board at roughly **2-6 m** and cover several viewing angles;
 - ensure each hole boundary has enough returns before calibration, otherwise the frame will be skipped with a log message.
 
+### Standalone cropped-board circle extraction
+
+If you already manually cropped a single calibration-board point cloud and only want ordered circle centers, build and run `circle_center_extract`:
+
+```bash
+rosrun fast_calib circle_center_extract input_board.pcd output_centers.txt 3 4 0.015 20
+```
+
+Arguments:
+
+- `input_board.pcd`: cropped point cloud containing one board
+- `output_centers.txt`: text file written in row/column order
+- `3 4`: board row and column counts
+- `0.015`: Euclidean clustering tolerance in metres for per-hole boundary clusters
+- `20` (optional): minimum cluster size
+
+Output rows use the format:
+
+```txt
+row col center_x center_y center_z radius mean_abs_error
+```
+
 ## 4. Run Examples
 
 Prepare static acquisition data in the `calib_data` folder (Download the example data from [Google Drive](https://drive.google.com/drive/folders/1VnMCsGj3Gat7dxe6IION0SfS7jYNMw1g?usp=sharing)):
