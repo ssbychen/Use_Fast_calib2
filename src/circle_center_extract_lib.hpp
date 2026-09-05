@@ -144,6 +144,55 @@ inline bool assignQuantizedGridBySpacing(const std::vector<GridProjection>& proj
   return true;
 }
 
+inline bool assignQuantizedGridBySpacingWithOrigin(const std::vector<GridProjection>& projections,
+                                                   int rows,
+                                                   int cols,
+                                                   double row_spacing,
+                                                   double col_spacing,
+                                                   double origin_row,
+                                                   double origin_col,
+                                                   double residual_tolerance,
+                                                   std::vector<int>& ordered_indices,
+                                                   double& score)
+{
+  const int expected = rows * cols;
+  ordered_indices.assign(static_cast<size_t>(expected), -1);
+  score = std::numeric_limits<double>::max();
+  if (row_spacing <= 0.0 || col_spacing <= 0.0) return false;
+
+  double local_score = 0.0;
+  for (const auto& p : projections)
+  {
+    const double row_value = (p.row_value - origin_row) / row_spacing;
+    const double col_value = (p.col_value - origin_col) / col_spacing;
+
+    const int row = static_cast<int>(std::llround(row_value));
+    const int col = static_cast<int>(std::llround(col_value));
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return false;
+
+    const double row_residual = row_value - static_cast<double>(row);
+    const double col_residual = col_value - static_cast<double>(col);
+    if (std::fabs(row_residual) > residual_tolerance ||
+        std::fabs(col_residual) > residual_tolerance)
+    {
+      return false;
+    }
+
+    const int slot = row * cols + col;
+    if (ordered_indices[static_cast<size_t>(slot)] >= 0) return false;
+    ordered_indices[static_cast<size_t>(slot)] = p.index;
+
+    local_score += row_residual * row_residual + col_residual * col_residual;
+  }
+
+  for (int idx : ordered_indices)
+  {
+    if (idx < 0) return false;
+  }
+  score = local_score;
+  return true;
+}
+
 inline bool sortGridIndicesLegacy(const std::vector<Eigen::Vector2d>& points,
                                   int rows,
                                   int cols,
@@ -290,6 +339,7 @@ inline bool sortGridIndices(const std::vector<Eigen::Vector2d>& points,
 
   double best_score = std::numeric_limits<double>::max();
   std::vector<int> best_indices;
+  const double residual_tolerance = 0.35;
 
   for (const auto& assignment : assignments)
   {
@@ -302,25 +352,31 @@ inline bool sortGridIndices(const std::vector<Eigen::Vector2d>& points,
                                     static_cast<double>(row_sign) * assignment.first,
                                     static_cast<double>(col_sign) * assignment.second);
 
-        std::vector<int> current_indices;
-        double score = std::numeric_limits<double>::max();
-        if (!assignQuantizedGridBySpacing(projections,
-                                          rows,
-                                          cols,
-                                          row_spacing,
-                                          col_spacing,
-                                          current_indices,
-                                          score))
+        for (const auto& anchor : projections)
         {
-          continue;
-        }
+          std::vector<int> current_indices;
+          double score = std::numeric_limits<double>::max();
+          if (!assignQuantizedGridBySpacingWithOrigin(projections,
+                                                      rows,
+                                                      cols,
+                                                      row_spacing,
+                                                      col_spacing,
+                                                      anchor.row_value,
+                                                      anchor.col_value,
+                                                      residual_tolerance,
+                                                      current_indices,
+                                                      score))
+          {
+            continue;
+          }
 
-        if (score + 1e-12 < best_score ||
-            (std::fabs(score - best_score) <= 1e-12 &&
-             lexicographicallyLess(current_indices, best_indices, points)))
-        {
-          best_score = score;
-          best_indices.swap(current_indices);
+          if (score + 1e-12 < best_score ||
+              (std::fabs(score - best_score) <= 1e-12 &&
+               lexicographicallyLess(current_indices, best_indices, points)))
+          {
+            best_score = score;
+            best_indices.swap(current_indices);
+          }
         }
       }
     }
@@ -329,6 +385,14 @@ inline bool sortGridIndices(const std::vector<Eigen::Vector2d>& points,
   if (best_indices.size() == points.size())
   {
     ordered_indices.swap(best_indices);
+    return true;
+  }
+
+  std::vector<int> legacy_indices;
+  std::string legacy_error;
+  if (sortGridIndicesLegacy(points, rows, cols, legacy_indices, &legacy_error))
+  {
+    ordered_indices.swap(legacy_indices);
     return true;
   }
 
