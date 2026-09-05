@@ -57,6 +57,7 @@ struct CircleCandidate
   CircleFit fit;
   pcl::PointXYZ plane_center;
   Eigen::Vector3d world_center = Eigen::Vector3d::Zero();
+  double plane_signed_distance = 0.0;
   int cluster_index = -1;
   size_t cluster_size = 0;
   double score = std::numeric_limits<double>::max();
@@ -229,6 +230,16 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr projectToPlane(const pcl::PointCloud<pcl::Po
 Eigen::Vector3d planeToWorld(const PlaneFrame& frame, double x, double y)
 {
   return frame.origin + frame.axis_x * x + frame.axis_y * y;
+}
+
+double signedDistanceToPlane(const PlaneFrame& frame, const Eigen::Vector3d& point)
+{
+  return (point - frame.origin).dot(frame.normal);
+}
+
+Eigen::Vector3d projectPointToPlane(const PlaneFrame& frame, const Eigen::Vector3d& point)
+{
+  return point - signedDistanceToPlane(frame, point) * frame.normal;
 }
 
 bool extractBoundaryCloud(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& aligned_cloud,
@@ -404,7 +415,8 @@ bool extractCircleCandidates(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& bou
     candidate.plane_center.x = static_cast<float>(fit.x);
     candidate.plane_center.y = static_cast<float>(fit.y);
     candidate.plane_center.z = 0.0f;
-    candidate.world_center = planeToWorld(frame, fit.x, fit.y);
+    candidate.world_center = projectPointToPlane(frame, planeToWorld(frame, fit.x, fit.y));
+    candidate.plane_signed_distance = signedDistanceToPlane(frame, candidate.world_center);
     candidate.cluster_index = static_cast<int>(cluster_index);
     candidate.cluster_size = cluster->size();
     candidates.push_back(candidate);
@@ -429,45 +441,55 @@ bool extractCircleCandidates(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& bou
   return true;
 }
 
-bool assignGridBySpacings(std::vector<CircleCandidate>& candidates,
-                          int rows,
-                          int cols,
-                          double row_spacing,
-                          double col_spacing,
-                          std::string* error)
+bool validateOrderedGridGeometry(const std::vector<CircleCandidate>& candidates,
+                                 int rows,
+                                 int cols,
+                                 double row_spacing,
+                                 double col_spacing,
+                                 std::string* error)
 {
-  if (static_cast<int>(candidates.size()) != rows * cols)
+  if (rows <= 0 || cols <= 0 || static_cast<int>(candidates.size()) != rows * cols)
   {
-    if (error) *error = "candidate count does not match rows*cols";
+    if (error) *error = "ordered candidate count does not match rows*cols";
     return false;
   }
 
-  std::vector<int> row_counts(rows, 0);
-  std::vector<int> col_counts(cols, 0);
-  for (const auto& c : candidates)
+  const double row_spacing_tolerance = std::max(0.002, row_spacing * 0.35);
+  const double col_spacing_tolerance = std::max(0.002, col_spacing * 0.35);
+  for (int row = 0; row < rows; ++row)
   {
-    if (c.row >= 0 && c.row < rows) ++row_counts[c.row];
-    if (c.col >= 0 && c.col < cols) ++col_counts[c.col];
-  }
-  for (int r = 0; r < rows; ++r)
-  {
-    if (row_counts[r] != cols)
+    for (int col = 0; col + 1 < cols; ++col)
     {
-      if (error) *error = "failed to assign a complete row";
-      return false;
-    }
-  }
-  for (int c = 0; c < cols; ++c)
-  {
-    if (col_counts[c] != rows)
-    {
-      if (error) *error = "failed to assign a complete column";
-      return false;
+      const CircleCandidate& left = candidates[static_cast<size_t>(row * cols + col)];
+      const CircleCandidate& right = candidates[static_cast<size_t>(row * cols + col + 1)];
+      const double dx = static_cast<double>(right.plane_center.x - left.plane_center.x);
+      const double dy = static_cast<double>(right.plane_center.y - left.plane_center.y);
+      const double spacing = std::sqrt(dx * dx + dy * dy);
+      if (!std::isfinite(spacing) || std::fabs(spacing - col_spacing) > col_spacing_tolerance)
+      {
+        if (error) *error = "inconsistent horizontal grid spacing";
+        return false;
+      }
     }
   }
 
-  (void)row_spacing;
-  (void)col_spacing;
+  for (int row = 0; row + 1 < rows; ++row)
+  {
+    for (int col = 0; col < cols; ++col)
+    {
+      const CircleCandidate& top = candidates[static_cast<size_t>(row * cols + col)];
+      const CircleCandidate& bottom = candidates[static_cast<size_t>((row + 1) * cols + col)];
+      const double dx = static_cast<double>(bottom.plane_center.x - top.plane_center.x);
+      const double dy = static_cast<double>(bottom.plane_center.y - top.plane_center.y);
+      const double spacing = std::sqrt(dx * dx + dy * dy);
+      if (!std::isfinite(spacing) || std::fabs(spacing - row_spacing) > row_spacing_tolerance)
+      {
+        if (error) *error = "inconsistent vertical grid spacing";
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 
@@ -484,7 +506,7 @@ bool writeResults(const std::string& output_path,
   }
 
   output << std::fixed << std::setprecision(9);
-  output << "# row col center_x center_y center_z radius mean_abs_error\n";
+  output << "# row col center_x center_y center_z radius mean_abs_error plane_signed_distance\n";
   for (int row = 0; row < rows; ++row)
   {
     for (int col = 0; col < cols; ++col)
@@ -496,7 +518,8 @@ bool writeResults(const std::string& output_path,
              << candidate.world_center.y() << ' '
              << candidate.world_center.z() << ' '
              << candidate.fit.radius << ' '
-             << candidate.fit.mean_abs_error << '\n';
+             << candidate.fit.mean_abs_error << ' '
+             << candidate.plane_signed_distance << '\n';
     }
   }
   return true;
@@ -612,7 +635,13 @@ int main(int argc, char** argv)
 
   std::vector<int> ordered_indices;
   std::string order_error;
-  if (!circle_center_extract::sortGridIndices(points, options.rows, options.cols, ordered_indices, &order_error))
+  if (!circle_center_extract::sortGridIndices(points,
+                                              options.rows,
+                                              options.cols,
+                                              options.row_spacing,
+                                              options.col_spacing,
+                                              ordered_indices,
+                                              &order_error))
   {
     std::cerr << "Failed to order fitted circles into a grid: " << order_error << std::endl;
     return 1;
@@ -625,29 +654,34 @@ int main(int argc, char** argv)
     ordered_candidates.push_back(candidates[static_cast<size_t>(index)]);
   }
 
-  double min_x = std::numeric_limits<double>::max();
-  double min_y = std::numeric_limits<double>::max();
-  for (auto& candidate : ordered_candidates)
+  constexpr double kMaxPlaneDistanceResidual = 1e-6;
+  for (size_t index = 0; index < ordered_candidates.size(); ++index)
   {
-    min_x = std::min(min_x, static_cast<double>(candidate.plane_center.x));
-    min_y = std::min(min_y, static_cast<double>(candidate.plane_center.y));
+    CircleCandidate& candidate = ordered_candidates[index];
+    candidate.row = static_cast<int>(index) / options.cols;
+    candidate.col = static_cast<int>(index) % options.cols;
+
+    candidate.world_center = projectPointToPlane(frame, candidate.world_center);
+    candidate.plane_signed_distance = signedDistanceToPlane(frame, candidate.world_center);
+    if (std::fabs(candidate.plane_signed_distance) > kMaxPlaneDistanceResidual)
+    {
+      std::cerr << "Center (" << candidate.row << ", " << candidate.col
+                << ") failed coplanarity check with signed distance "
+                << candidate.plane_signed_distance << std::endl;
+      return 1;
+    }
   }
 
-  for (auto& candidate : ordered_candidates)
+  std::string geometry_error;
+  if (!validateOrderedGridGeometry(ordered_candidates,
+                                   options.rows,
+                                   options.cols,
+                                   options.row_spacing,
+                                   options.col_spacing,
+                                   &geometry_error))
   {
-    candidate.row = static_cast<int>(std::llround((candidate.plane_center.y - min_y) / options.row_spacing));
-    candidate.col = static_cast<int>(std::llround((candidate.plane_center.x - min_x) / options.col_spacing));
-  }
-
-  std::string assign_error;
-  if (!assignGridBySpacings(ordered_candidates,
-                            options.rows,
-                            options.cols,
-                            options.row_spacing,
-                            options.col_spacing,
-                            &assign_error))
-  {
-    std::cerr << "Grid assignment warning: " << assign_error << std::endl;
+    std::cerr << "Grid geometry consistency check failed: " << geometry_error << std::endl;
+    return 1;
   }
 
   if (!writeResults(options.output_txt_path, options.rows, options.cols, ordered_candidates))

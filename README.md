@@ -107,7 +107,7 @@ MID360 suggestions:
 If you already manually cropped a single calibration-board point cloud and only want ordered circle centers, build and run `circle_center_extract`:
 
 ```bash
-rosrun fast_calib circle_center_extract input_board.pcd output_centers.txt 3 4 0.015 20
+rosrun fast_calib circle_center_extract input_board.pcd output_centers.txt 3 4 0.10 0.15 0.015 20
 ```
 
 Arguments:
@@ -115,13 +115,17 @@ Arguments:
 - `input_board.pcd`: cropped point cloud containing one board
 - `output_centers.txt`: text file written in row/column order
 - `3 4`: board row and column counts
+- `0.10`: row spacing (metres, adjacent rows)
+- `0.15`: column spacing (metres, adjacent columns)
 - `0.015`: Euclidean clustering tolerance in metres for per-hole boundary clusters
 - `20` (optional): minimum cluster size
+- `expected_radius` (optional, default `0.12 m`): expected hole radius
+- `radius_tolerance` (optional, default `0.03 m`): allowed radius deviation
 
 Output rows use the format:
 
 ```txt
-row col center_x center_y center_z radius mean_abs_error
+row col center_x center_y center_z radius mean_abs_error plane_signed_distance
 ```
 
 ## 4. Run Examples
