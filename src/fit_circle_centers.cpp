@@ -26,12 +26,12 @@ struct CliOptions
   std::string output_txt_path;
   int rows = 0;
   int cols = 0;
+  double row_spacing = 0.0;
+  double col_spacing = 0.0;
   double cluster_tolerance = 0.0;
   int min_cluster_size = 30;
   double expected_radius = 0.12;
   double radius_tolerance = 0.03;
-  double min_center_distance = 0.6403124237;
-  double center_distance_tolerance = 0.08;
 };
 
 struct PlaneFrame
@@ -60,14 +60,16 @@ struct CircleCandidate
   int cluster_index = -1;
   size_t cluster_size = 0;
   double score = std::numeric_limits<double>::max();
+  int row = -1;
+  int col = -1;
 };
 
 void printUsage()
 {
   std::cerr
       << "Usage: circle_center_extract <input.pcd> <output.txt> <rows> <cols> "
-      << "<cluster_tolerance> [min_cluster_size] [expected_radius(m)] "
-      << "[radius_tolerance(m)] [min_center_distance(m)] [center_distance_tolerance(m)]\n";
+      << "<row_spacing> <col_spacing> <cluster_tolerance> [min_cluster_size] "
+      << "[expected_radius(m)] [radius_tolerance(m)]\n";
 }
 
 bool parseInt(const std::string& text, int& value)
@@ -104,7 +106,7 @@ bool parseDouble(const std::string& text, double& value)
 
 bool parseCli(int argc, char** argv, CliOptions& options)
 {
-  if (argc < 6)
+  if (argc < 8)
   {
     printUsage();
     return false;
@@ -114,40 +116,31 @@ bool parseCli(int argc, char** argv, CliOptions& options)
   options.output_txt_path = argv[2];
   if (!parseInt(argv[3], options.rows) ||
       !parseInt(argv[4], options.cols) ||
-      !parseDouble(argv[5], options.cluster_tolerance))
+      !parseDouble(argv[5], options.row_spacing) ||
+      !parseDouble(argv[6], options.col_spacing) ||
+      !parseDouble(argv[7], options.cluster_tolerance))
   {
-    std::cerr << "Failed to parse rows/cols/cluster_tolerance." << std::endl;
+    std::cerr << "Failed to parse rows/cols/row_spacing/col_spacing/cluster_tolerance."
+              << std::endl;
     printUsage();
     return false;
   }
 
-  if (argc >= 7 && !parseInt(argv[6], options.min_cluster_size))
+  if (argc >= 9 && !parseInt(argv[8], options.min_cluster_size))
   {
     std::cerr << "Failed to parse min_cluster_size." << std::endl;
     printUsage();
     return false;
   }
-  if (argc >= 8 && !parseDouble(argv[7], options.expected_radius))
+  if (argc >= 10 && !parseDouble(argv[9], options.expected_radius))
   {
     std::cerr << "Failed to parse expected_radius (meters)." << std::endl;
     printUsage();
     return false;
   }
-  if (argc >= 9 && !parseDouble(argv[8], options.radius_tolerance))
+  if (argc >= 11 && !parseDouble(argv[10], options.radius_tolerance))
   {
     std::cerr << "Failed to parse radius_tolerance (meters)." << std::endl;
-    printUsage();
-    return false;
-  }
-  if (argc >= 10 && !parseDouble(argv[9], options.min_center_distance))
-  {
-    std::cerr << "Failed to parse min_center_distance (meters)." << std::endl;
-    printUsage();
-    return false;
-  }
-  if (argc >= 11 && !parseDouble(argv[10], options.center_distance_tolerance))
-  {
-    std::cerr << "Failed to parse center_distance_tolerance (meters)." << std::endl;
     printUsage();
     return false;
   }
@@ -155,6 +148,12 @@ bool parseCli(int argc, char** argv, CliOptions& options)
   if (options.rows <= 0 || options.cols <= 0)
   {
     std::cerr << "rows and cols must be positive." << std::endl;
+    return false;
+  }
+  if (!std::isfinite(options.row_spacing) || options.row_spacing <= 0.0 ||
+      !std::isfinite(options.col_spacing) || options.col_spacing <= 0.0)
+  {
+    std::cerr << "row_spacing and col_spacing must be finite positive values." << std::endl;
     return false;
   }
   if (!std::isfinite(options.cluster_tolerance) || options.cluster_tolerance <= 0.0)
@@ -169,29 +168,12 @@ bool parseCli(int argc, char** argv, CliOptions& options)
   }
   if (!std::isfinite(options.expected_radius) || options.expected_radius <= 0.0)
   {
-    std::cerr << "expected_radius must be a finite positive value in meters (e.g. 0.12)."
-              << std::endl;
+    std::cerr << "expected_radius must be a finite positive value in meters." << std::endl;
     return false;
   }
   if (!std::isfinite(options.radius_tolerance) || options.radius_tolerance <= 0.0)
   {
-    std::cerr << "radius_tolerance must be a finite positive value in meters (e.g. 0.03)."
-              << std::endl;
-    return false;
-  }
-  if (!std::isfinite(options.min_center_distance) || options.min_center_distance <= 0.0)
-  {
-    std::cerr
-        << "min_center_distance must be a finite positive value in meters (e.g. 0.6403124237)."
-              << std::endl;
-    return false;
-  }
-  if (!std::isfinite(options.center_distance_tolerance) ||
-      options.center_distance_tolerance <= 0.0)
-  {
-    std::cerr
-        << "center_distance_tolerance must be a finite positive value in meters (e.g. 0.08)."
-        << std::endl;
+    std::cerr << "radius_tolerance must be a finite positive value in meters." << std::endl;
     return false;
   }
   return true;
@@ -447,6 +429,48 @@ bool extractCircleCandidates(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& bou
   return true;
 }
 
+bool assignGridBySpacings(std::vector<CircleCandidate>& candidates,
+                          int rows,
+                          int cols,
+                          double row_spacing,
+                          double col_spacing,
+                          std::string* error)
+{
+  if (static_cast<int>(candidates.size()) != rows * cols)
+  {
+    if (error) *error = "candidate count does not match rows*cols";
+    return false;
+  }
+
+  std::vector<int> row_counts(rows, 0);
+  std::vector<int> col_counts(cols, 0);
+  for (const auto& c : candidates)
+  {
+    if (c.row >= 0 && c.row < rows) ++row_counts[c.row];
+    if (c.col >= 0 && c.col < cols) ++col_counts[c.col];
+  }
+  for (int r = 0; r < rows; ++r)
+  {
+    if (row_counts[r] != cols)
+    {
+      if (error) *error = "failed to assign a complete row";
+      return false;
+    }
+  }
+  for (int c = 0; c < cols; ++c)
+  {
+    if (col_counts[c] != rows)
+    {
+      if (error) *error = "failed to assign a complete column";
+      return false;
+    }
+  }
+
+  (void)row_spacing;
+  (void)col_spacing;
+  return true;
+}
+
 bool writeResults(const std::string& output_path,
                   int rows,
                   int cols,
@@ -552,6 +576,7 @@ int main(int argc, char** argv)
 
   std::vector<CircleCandidate> unique_candidates;
   unique_candidates.reserve(candidates.size());
+  const double duplicate_threshold = 0.5 * std::min(options.row_spacing, options.col_spacing);
   for (const auto& candidate : candidates)
   {
     bool duplicate = false;
@@ -559,8 +584,7 @@ int main(int argc, char** argv)
     {
       const double dx = candidate.plane_center.x - existing.plane_center.x;
       const double dy = candidate.plane_center.y - existing.plane_center.y;
-      const double min_distance = 0.6 * std::max(candidate.fit.radius, existing.fit.radius);
-      if ((dx * dx + dy * dy) <= (min_distance * min_distance))
+      if ((dx * dx + dy * dy) <= (duplicate_threshold * duplicate_threshold))
       {
         duplicate = true;
         break;
@@ -569,30 +593,6 @@ int main(int argc, char** argv)
     if (!duplicate) unique_candidates.push_back(candidate);
   }
   candidates.swap(unique_candidates);
-
-  std::vector<CircleCandidate> geometry_filtered;
-  geometry_filtered.reserve(candidates.size());
-  for (size_t i = 0; i < candidates.size(); ++i)
-  {
-    bool has_neighbor = false;
-    for (size_t j = 0; j < candidates.size(); ++j)
-    {
-      if (i == j) continue;
-      const double dx =
-          static_cast<double>(candidates[i].plane_center.x - candidates[j].plane_center.x);
-      const double dy =
-          static_cast<double>(candidates[i].plane_center.y - candidates[j].plane_center.y);
-      const double center_distance = std::sqrt(dx * dx + dy * dy);
-      if (std::fabs(center_distance - options.min_center_distance) <=
-          options.center_distance_tolerance)
-      {
-        has_neighbor = true;
-        break;
-      }
-    }
-    if (has_neighbor) geometry_filtered.push_back(candidates[i]);
-  }
-  if (!geometry_filtered.empty()) candidates.swap(geometry_filtered);
 
   if (static_cast<int>(candidates.size()) < expected_count)
   {
@@ -603,19 +603,16 @@ int main(int argc, char** argv)
   }
   candidates.resize(static_cast<size_t>(expected_count));
 
-  pcl::PointCloud<pcl::PointXYZ>::Ptr plane_centers(new pcl::PointCloud<pcl::PointXYZ>);
-  plane_centers->reserve(candidates.size());
-  for (const auto& candidate : candidates) plane_centers->push_back(candidate.plane_center);
+  std::vector<Eigen::Vector2d> points;
+  points.reserve(candidates.size());
+  for (const auto& candidate : candidates)
+  {
+    points.emplace_back(candidate.plane_center.x, candidate.plane_center.y);
+  }
 
   std::vector<int> ordered_indices;
   std::string order_error;
-  pcl::PointCloud<pcl::PointXYZ>::Ptr ordered_plane_centers(new pcl::PointCloud<pcl::PointXYZ>);
-  if (!circle_center_extract::sortGridCloud(plane_centers,
-                                            options.rows,
-                                            options.cols,
-                                            ordered_plane_centers,
-                                            &ordered_indices,
-                                            &order_error))
+  if (!circle_center_extract::sortGridIndices(points, options.rows, options.cols, ordered_indices, &order_error))
   {
     std::cerr << "Failed to order fitted circles into a grid: " << order_error << std::endl;
     return 1;
@@ -626,6 +623,31 @@ int main(int argc, char** argv)
   for (int index : ordered_indices)
   {
     ordered_candidates.push_back(candidates[static_cast<size_t>(index)]);
+  }
+
+  double min_x = std::numeric_limits<double>::max();
+  double min_y = std::numeric_limits<double>::max();
+  for (auto& candidate : ordered_candidates)
+  {
+    min_x = std::min(min_x, static_cast<double>(candidate.plane_center.x));
+    min_y = std::min(min_y, static_cast<double>(candidate.plane_center.y));
+  }
+
+  for (auto& candidate : ordered_candidates)
+  {
+    candidate.row = static_cast<int>(std::llround((candidate.plane_center.y - min_y) / options.row_spacing));
+    candidate.col = static_cast<int>(std::llround((candidate.plane_center.x - min_x) / options.col_spacing));
+  }
+
+  std::string assign_error;
+  if (!assignGridBySpacings(ordered_candidates,
+                            options.rows,
+                            options.cols,
+                            options.row_spacing,
+                            options.col_spacing,
+                            &assign_error))
+  {
+    std::cerr << "Grid assignment warning: " << assign_error << std::endl;
   }
 
   if (!writeResults(options.output_txt_path, options.rows, options.cols, ordered_candidates))
