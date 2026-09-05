@@ -28,6 +28,10 @@ struct CliOptions
   int cols = 0;
   double cluster_tolerance = 0.0;
   int min_cluster_size = 30;
+  double expected_radius = 0.12;
+  double radius_tolerance = 0.03;
+  double min_center_distance = 0.6403124237;
+  double center_distance_tolerance = 0.08;
 };
 
 struct PlaneFrame
@@ -62,7 +66,8 @@ void printUsage()
 {
   std::cerr
       << "Usage: circle_center_extract <input.pcd> <output.txt> <rows> <cols> "
-      << "<cluster_tolerance> [min_cluster_size]\n";
+      << "<cluster_tolerance> [min_cluster_size] [expected_radius(m)] "
+      << "[radius_tolerance(m)] [min_center_distance(m)] [center_distance_tolerance(m)]\n";
 }
 
 bool parseInt(const std::string& text, int& value)
@@ -122,6 +127,30 @@ bool parseCli(int argc, char** argv, CliOptions& options)
     printUsage();
     return false;
   }
+  if (argc >= 8 && !parseDouble(argv[7], options.expected_radius))
+  {
+    std::cerr << "Failed to parse expected_radius (meters)." << std::endl;
+    printUsage();
+    return false;
+  }
+  if (argc >= 9 && !parseDouble(argv[8], options.radius_tolerance))
+  {
+    std::cerr << "Failed to parse radius_tolerance (meters)." << std::endl;
+    printUsage();
+    return false;
+  }
+  if (argc >= 10 && !parseDouble(argv[9], options.min_center_distance))
+  {
+    std::cerr << "Failed to parse min_center_distance (meters)." << std::endl;
+    printUsage();
+    return false;
+  }
+  if (argc >= 11 && !parseDouble(argv[10], options.center_distance_tolerance))
+  {
+    std::cerr << "Failed to parse center_distance_tolerance (meters)." << std::endl;
+    printUsage();
+    return false;
+  }
 
   if (options.rows <= 0 || options.cols <= 0)
   {
@@ -136,6 +165,33 @@ bool parseCli(int argc, char** argv, CliOptions& options)
   if (options.min_cluster_size < 8)
   {
     std::cerr << "min_cluster_size must be at least 8." << std::endl;
+    return false;
+  }
+  if (!std::isfinite(options.expected_radius) || options.expected_radius <= 0.0)
+  {
+    std::cerr << "expected_radius must be a finite positive value in meters (e.g. 0.12)."
+              << std::endl;
+    return false;
+  }
+  if (!std::isfinite(options.radius_tolerance) || options.radius_tolerance <= 0.0)
+  {
+    std::cerr << "radius_tolerance must be a finite positive value in meters (e.g. 0.03)."
+              << std::endl;
+    return false;
+  }
+  if (!std::isfinite(options.min_center_distance) || options.min_center_distance <= 0.0)
+  {
+    std::cerr
+        << "min_center_distance must be a finite positive value in meters (e.g. 0.6403124237)."
+              << std::endl;
+    return false;
+  }
+  if (!std::isfinite(options.center_distance_tolerance) ||
+      options.center_distance_tolerance <= 0.0)
+  {
+    std::cerr
+        << "center_distance_tolerance must be a finite positive value in meters (e.g. 0.08)."
+        << std::endl;
     return false;
   }
   return true;
@@ -340,6 +396,7 @@ bool fitCircleRobust(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cluster, Ci
 bool extractCircleCandidates(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& boundary_cloud,
                              const std::vector<pcl::PointIndices>& cluster_indices,
                              const PlaneFrame& frame,
+                             const CliOptions& options,
                              std::vector<CircleCandidate>& candidates)
 {
   candidates.clear();
@@ -357,6 +414,7 @@ bool extractCircleCandidates(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& bou
     CircleFit fit;
     if (!fitCircleRobust(cluster, fit)) continue;
     if (fit.radius <= 0.0 || !std::isfinite(fit.radius)) continue;
+    if (std::fabs(fit.radius - options.expected_radius) > options.radius_tolerance) continue;
     if ((fit.mean_abs_error / fit.radius) > 0.35) continue;
 
     CircleCandidate candidate;
@@ -468,7 +526,7 @@ int main(int argc, char** argv)
   }
 
   std::vector<CircleCandidate> candidates;
-  if (!extractCircleCandidates(boundary_cloud, cluster_indices, frame, candidates))
+  if (!extractCircleCandidates(boundary_cloud, cluster_indices, frame, options, candidates))
   {
     std::cerr << "Failed to fit any circular boundary clusters." << std::endl;
     return 1;
@@ -511,6 +569,30 @@ int main(int argc, char** argv)
     if (!duplicate) unique_candidates.push_back(candidate);
   }
   candidates.swap(unique_candidates);
+
+  std::vector<CircleCandidate> geometry_filtered;
+  geometry_filtered.reserve(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i)
+  {
+    bool has_neighbor = false;
+    for (size_t j = 0; j < candidates.size(); ++j)
+    {
+      if (i == j) continue;
+      const double dx =
+          static_cast<double>(candidates[i].plane_center.x - candidates[j].plane_center.x);
+      const double dy =
+          static_cast<double>(candidates[i].plane_center.y - candidates[j].plane_center.y);
+      const double center_distance = std::sqrt(dx * dx + dy * dy);
+      if (std::fabs(center_distance - options.min_center_distance) <=
+          options.center_distance_tolerance)
+      {
+        has_neighbor = true;
+        break;
+      }
+    }
+    if (has_neighbor) geometry_filtered.push_back(candidates[i]);
+  }
+  if (!geometry_filtered.empty()) candidates.swap(geometry_filtered);
 
   if (static_cast<int>(candidates.size()) < expected_count)
   {
