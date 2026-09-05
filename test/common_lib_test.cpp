@@ -277,6 +277,99 @@ TEST(TargetSorting, SortsStandaloneExtractionGridWithoutSpacingHints)
   EXPECT_EQ(std::abs(col_sequence[3] - col_sequence[2]), 1);
 }
 
+TEST(TargetSorting, SortsStandaloneExtractionGridWithUnequalSpacingHints)
+{
+  const int rows = 3;
+  const int cols = 4;
+  const double row_spacing = 0.09;
+  const double col_spacing = 0.16;
+  const double angle = 0.31;
+  const double cos_a = std::cos(angle);
+  const double sin_a = std::sin(angle);
+  const Eigen::Vector2d translation(-0.8, 0.3);
+
+  std::vector<Eigen::Vector2d> ordered_points;
+  std::vector<std::pair<int, int>> ordered_labels;
+  ordered_points.reserve(rows * cols);
+  ordered_labels.reserve(rows * cols);
+  for (int row = 0; row < rows; ++row)
+  {
+    for (int col = 0; col < cols; ++col)
+    {
+      const Eigen::Vector2d base(col_spacing * static_cast<double>(col),
+                                 row_spacing * static_cast<double>(row));
+      const Eigen::Vector2d rotated(cos_a * base.x() - sin_a * base.y(),
+                                    sin_a * base.x() + cos_a * base.y());
+      ordered_points.push_back(rotated + translation);
+      ordered_labels.emplace_back(row, col);
+    }
+  }
+
+  const std::vector<int> shuffled = {8, 2, 11, 0, 6, 9, 1, 10, 3, 5, 4, 7};
+  std::vector<Eigen::Vector2d> shuffled_points;
+  std::vector<std::pair<int, int>> shuffled_labels;
+  for (int index : shuffled)
+  {
+    shuffled_points.push_back(ordered_points[static_cast<size_t>(index)]);
+    shuffled_labels.push_back(ordered_labels[static_cast<size_t>(index)]);
+  }
+
+  std::vector<int> ordered_indices;
+  std::string error;
+  ASSERT_TRUE(circle_center_extract::sortGridIndices(shuffled_points,
+                                                     rows,
+                                                     cols,
+                                                     row_spacing,
+                                                     col_spacing,
+                                                     ordered_indices,
+                                                     &error))
+      << error;
+
+  ASSERT_EQ(ordered_indices.size(), shuffled_points.size());
+  std::vector<int> row_sequence;
+  std::vector<int> col_sequence;
+  row_sequence.reserve(rows);
+  col_sequence.reserve(cols);
+  for (int row = 0; row < rows; ++row)
+  {
+    row_sequence.push_back(
+        shuffled_labels[static_cast<size_t>(ordered_indices[static_cast<size_t>(row * cols)])].first);
+    for (int col = 0; col < cols; ++col)
+    {
+      const auto& label =
+          shuffled_labels[static_cast<size_t>(ordered_indices[static_cast<size_t>(row * cols + col)])];
+      EXPECT_EQ(label.first, row_sequence.back());
+      if (row == 0) col_sequence.push_back(label.second);
+      else EXPECT_EQ(label.second, col_sequence[static_cast<size_t>(col)]);
+    }
+  }
+  EXPECT_EQ(std::abs(row_sequence[1] - row_sequence[0]), 1);
+  EXPECT_EQ(std::abs(row_sequence[2] - row_sequence[1]), 1);
+  EXPECT_EQ(std::abs(col_sequence[1] - col_sequence[0]), 1);
+  EXPECT_EQ(std::abs(col_sequence[2] - col_sequence[1]), 1);
+  EXPECT_EQ(std::abs(col_sequence[3] - col_sequence[2]), 1);
+}
+
+TEST(TargetSorting, RejectsInconsistentSpacingHints)
+{
+  const int rows = 2;
+  const int cols = 3;
+  const std::vector<Eigen::Vector2d> points = {
+      {0.0, 0.0}, {0.10, 0.0}, {0.20, 0.0},
+      {0.0, 0.05}, {0.10, 0.05}, {0.20, 0.05}};
+
+  std::vector<int> ordered_indices;
+  std::string error;
+  EXPECT_FALSE(circle_center_extract::sortGridIndices(points,
+                                                      rows,
+                                                      cols,
+                                                      0.5,
+                                                      0.5,
+                                                      ordered_indices,
+                                                      &error));
+  EXPECT_FALSE(error.empty());
+}
+
 TEST(OutputDirectory, CreatesMissingParents)
 {
   const std::string root =
